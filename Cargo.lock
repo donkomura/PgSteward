@@ -1540,8 +1540,10 @@ name = "pgsteward-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fallible-iterator",
  "pgsteward-protocol",
  "pgsteward-sched",
+ "postgres-protocol",
  "proptest",
  "thiserror",
  "tokio",
