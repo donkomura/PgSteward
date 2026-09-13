@@ -14,7 +14,8 @@ M1 で単体の予算スケジューラを作り、M2 でそれを分散させ�
 | M1-02 フレーミングと ReadyForQuery 状態機械 | 完了（2026-09-13、PR #1） | `pgsteward-protocol::{framing, message, ready}` |
 | M1-03 スタートアップの判別 | 完了（2026-09-13、PR #2） | `pgsteward-protocol::startup`（SSLRequest / GSSENCRequest / CancelRequest / StartupMessage の判別と符号化）、`pgsteward-core::tenant`（`TenantId`） |
 | M1-04 DB 接続の確立と総予算の導出 | 完了（2026-09-14、PR #7）。1 つの CL には大きいので、総予算の導出（純粋関数、PR #3）→ DB 接続の確立（trust と MD5、PR #4）→ SCRAM 認証（PR #5）→ `SHOW` と `pg_stat_activity` の読み取り（PR #6）→ 他者の接続の観測ピークと導出値の更新（PR #7）、の順に分けて進めた | `pgsteward-core::budget`（`ServerLimits`、`BudgetInputs`、`TotalBudget`、`ForeignPeak`、`InstanceBudget`、`BudgetChange`）、`pgsteward-core::server`（`ApplicationName`、`ServerCredentials`、`ServerConnection::handshake`（trust / MD5 / SCRAM-SHA-256）、`connect`、`SimpleQuery`）、`pgsteward-core::inspect`（`read_server_limits`、`read_timeout_settings`、`count_foreign_connections`） |
-| M1-05 以降 | 未着手 | |
+| M1-05 クライアント認証 | 着手（2026-09-14）。1 つの CL には大きいので、スタートアップの応答とテナントの解決（暗号化要求の拒否と trust 相当の AuthenticationOk）→ SCRAM-SHA-256 でのクライアント認証 → 資格情報の読み込み、の順に分けて進める。スタートアップの応答まで実装済み。**サーバー側の SCRAM は自前で書く** — `scram-rs` はサーバー側の検証に SaltedPassword を要求し、PostgreSQL が実際に持つ verifier（salt・反復回数・StoredKey・ServerKey）だけでは検証できない。部品は `hmac` / `sha2` / `pbkdf2` / `base64` / `stringprep`（SaslPrep）で揃う。**クライアントの資格情報をどこから読むかは未決**（ノードローカル設定か `auth_query` 相当か） | `pgsteward-protocol::backend`（`EncryptionResponse`、`ErrorResponse`、`encode_authentication_ok`）、`pgsteward-core::session`（`accept`、`ClientSession`、`Accepted`、`AcceptError`） |
+| M1-06 以降 | 未着手 | |
 
 ## 用語
 

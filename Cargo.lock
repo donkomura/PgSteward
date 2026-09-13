@@ -1599,6 +1599,8 @@ name = "pgsteward-protocol"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fallible-iterator",
+ "postgres-protocol",
  "proptest",
  "thiserror",
 ]
@@ -1614,8 +1616,10 @@ dependencies = [
 name = "pgsteward-sim-tests"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "pgsteward-core",
  "pgsteward-harness",
+ "pgsteward-protocol",
  "tokio",
  "tracing",
  "turmoil",
