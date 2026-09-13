@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Design documents
 
-- `docs/design-doc.md` is the canonical source. Read chapter 8 for the control model, 14.1 for configuration, and chapter 9 for the glossary.
+- `docs/design-doc.md` is the canonical source. Read chapter 8 for the control model, 14.1 for configuration, and chapter 9 for the glossary. **It is internal and must never be published**: the path is gitignored, it exists only on the local machine, and it must not be committed, pushed, quoted at length in PRs, or copied into any published artifact.
 - `docs/plan.md` is the implementation plan. Each step is one small change with tests written first.
 - The comparison with existing poolers (`comparison.md`) and the research notes live outside the repository in `~/projects/distributed-connection-pooler/`.
 
