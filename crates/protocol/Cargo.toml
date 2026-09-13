@@ -11,6 +11,8 @@ bytes.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+fallible-iterator.workspace = true
+postgres-protocol.workspace = true
 proptest.workspace = true
 
 [lints]
