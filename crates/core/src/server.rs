@@ -8,7 +8,8 @@ use pgsteward_protocol::startup::{
     CancelKey, ProtocolVersion, StartupMessage, StartupRequest, encode_startup,
 };
 use postgres_protocol::authentication::md5_hash;
-use postgres_protocol::message::backend::{ErrorFields, Message};
+use postgres_protocol::authentication::sasl::{ChannelBinding, SCRAM_SHA_256, ScramSha256};
+use postgres_protocol::message::backend::{AuthenticationSaslBody, ErrorFields, Message};
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -71,6 +72,8 @@ pub enum HandshakeError {
     UnsupportedAuthentication(&'static str),
     #[error("server requested {0} authentication but no password is configured for this instance")]
     PasswordRequired(&'static str),
+    #[error("SCRAM-SHA-256 exchange failed: {0}")]
+    Scram(io::Error),
     #[error("protocol violation during startup: {0}")]
     UnexpectedMessage(&'static str),
     #[error("server closed the connection during startup")]
@@ -150,8 +153,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
                         secret_key: body.secret_key(),
                     });
                 }
-                Message::AuthenticationOk => startup.authenticated = true,
-                other => answer_authentication(&mut stream, credentials, other).await?,
+                Message::AuthenticationOk => startup.authentication_ok()?,
+                other => {
+                    answer_authentication(&mut stream, credentials, &mut startup, other).await?;
+                }
             }
         }
     }
@@ -182,13 +187,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
 }
 
 #[derive(Default)]
+enum ScramState {
+    #[default]
+    Absent,
+    InProgress(Box<ScramSha256>),
+    Proved,
+}
+
+#[derive(Default)]
 struct StartupState {
     parameters: BTreeMap<String, String>,
     backend_key: Option<CancelKey>,
     authenticated: bool,
+    scram: ScramState,
 }
 
 impl StartupState {
+    fn authentication_ok(&mut self) -> Result<(), HandshakeError> {
+        if matches!(self.scram, ScramState::InProgress(_)) {
+            return Err(HandshakeError::UnexpectedMessage(
+                "AuthenticationOk before the server proved itself with a SASL final message",
+            ));
+        }
+        self.authenticated = true;
+        Ok(())
+    }
+
+    fn scram_in_progress(&mut self) -> Result<&mut ScramSha256, HandshakeError> {
+        match &mut self.scram {
+            ScramState::InProgress(scram) => Ok(scram),
+            _ => Err(HandshakeError::UnexpectedMessage(
+                "SASL continuation without a SASL exchange",
+            )),
+        }
+    }
+
     fn ready(&self, status: u8) -> Result<CancelKey, HandshakeError> {
         if !self.authenticated {
             return Err(HandshakeError::UnexpectedMessage(
@@ -212,9 +245,42 @@ impl StartupState {
 async fn answer_authentication<S: AsyncWrite + Unpin>(
     stream: &mut S,
     credentials: &ServerCredentials,
+    startup: &mut StartupState,
     message: Message,
 ) -> Result<(), HandshakeError> {
     match message {
+        Message::AuthenticationSasl(body) => {
+            if !offers_scram_sha_256(&body)? {
+                return Err(HandshakeError::UnsupportedAuthentication(
+                    "SASL without the SCRAM-SHA-256 mechanism",
+                ));
+            }
+            let password = credentials
+                .password
+                .as_deref()
+                .ok_or(HandshakeError::PasswordRequired(SCRAM_SHA_256))?;
+            let scram = ScramSha256::new(password.as_bytes(), ChannelBinding::unsupported());
+            send(stream, |buf| {
+                frontend::sasl_initial_response(SCRAM_SHA_256, scram.message(), buf)
+            })
+            .await?;
+            startup.scram = ScramState::InProgress(Box::new(scram));
+            Ok(())
+        }
+        Message::AuthenticationSaslContinue(body) => {
+            let scram = startup.scram_in_progress()?;
+            scram.update(body.data()).map_err(HandshakeError::Scram)?;
+            send(stream, |buf| frontend::sasl_response(scram.message(), buf)).await?;
+            Ok(())
+        }
+        Message::AuthenticationSaslFinal(body) => {
+            startup
+                .scram_in_progress()?
+                .finish(body.data())
+                .map_err(HandshakeError::Scram)?;
+            startup.scram = ScramState::Proved;
+            Ok(())
+        }
         Message::AuthenticationMd5Password(body) => {
             let password = credentials
                 .password
@@ -234,7 +300,6 @@ async fn answer_authentication<S: AsyncWrite + Unpin>(
         Message::AuthenticationCleartextPassword => Err(HandshakeError::UnsupportedAuthentication(
             "cleartext password",
         )),
-        Message::AuthenticationSasl(_) => Err(HandshakeError::UnsupportedAuthentication("SASL")),
         Message::AuthenticationGss
         | Message::AuthenticationGssContinue(_)
         | Message::AuthenticationKerberosV5
@@ -244,13 +309,20 @@ async fn answer_authentication<S: AsyncWrite + Unpin>(
         Message::AuthenticationScmCredential => {
             Err(HandshakeError::UnsupportedAuthentication("SCM credential"))
         }
-        Message::AuthenticationSaslContinue(_) | Message::AuthenticationSaslFinal(_) => Err(
-            HandshakeError::UnexpectedMessage("SASL continuation without a SASL exchange"),
-        ),
         _ => Err(HandshakeError::UnexpectedMessage(
             "message other than authentication, ParameterStatus, BackendKeyData, ReadyForQuery or ErrorResponse before ReadyForQuery",
         )),
     }
+}
+
+fn offers_scram_sha_256(body: &AuthenticationSaslBody) -> Result<bool, HandshakeError> {
+    let mut mechanisms = body.mechanisms();
+    while let Some(mechanism) = mechanisms.next()? {
+        if mechanism == SCRAM_SHA_256 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn startup_request(

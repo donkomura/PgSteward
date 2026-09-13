@@ -52,6 +52,13 @@ fn credentials(database: &str) -> ServerCredentials {
     }
 }
 
+fn credentials_with_password(database: &str, password: &str) -> ServerCredentials {
+    ServerCredentials {
+        password: Some(password.to_owned()),
+        ..credentials(database)
+    }
+}
+
 #[tokio::test]
 async fn handshake_with_trust_auth_tags_the_connection_and_keeps_the_startup_parameters() {
     let container = Postgres::default()
@@ -109,6 +116,48 @@ async fn unknown_database_is_refused_with_the_server_sqlstate() {
             assert_eq!(code, "3D000");
             assert!(message.contains("no_such_database"), "{message}");
         }
+        other => panic!("expected a server error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn handshake_authenticates_with_scram_sha_256() {
+    let container = Postgres::default().with_tag("16").start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let observer = observer(port).await;
+
+    let conn = connect(
+        &TokioRuntime::new(),
+        &format!("127.0.0.1:{port}"),
+        &credentials_with_password("postgres", "postgres"),
+        &ApplicationName::new("scram"),
+    )
+    .await
+    .unwrap();
+
+    assert!(conn.backend_key().process_id > 0);
+    wait_for_count(&observer, "pgsteward-scram", 1).await;
+
+    conn.terminate().await.unwrap();
+    wait_for_count(&observer, "pgsteward-scram", 0).await;
+}
+
+#[tokio::test]
+async fn a_wrong_password_is_refused_with_the_server_sqlstate() {
+    let container = Postgres::default().with_tag("16").start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+
+    let err = connect(
+        &TokioRuntime::new(),
+        &format!("127.0.0.1:{port}"),
+        &credentials_with_password("postgres", "not-the-password"),
+        &ApplicationName::new("scram"),
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        ConnectError::Handshake(HandshakeError::Server { code, .. }) => assert_eq!(code, "28P01"),
         other => panic!("expected a server error, got {other:?}"),
     }
 }

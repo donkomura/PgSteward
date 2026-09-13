@@ -22,7 +22,10 @@ tracing.workspace = true
 turmoil = { workspace = true, optional = true }
 
 [dev-dependencies]
+base64.workspace = true
+hmac.workspace = true
 proptest.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 turmoil.workspace = true
 
