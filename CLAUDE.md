@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Writing rules
 
-- **Everything written into this repository is in English**: commit messages, PR titles and descriptions, documentation, error messages, log messages, and identifiers. The design documents under `docs/` predate this rule and are in Japanese; leave them as they are unless asked to translate them.
+- **Everything written into this repository is in English**: commit messages, PR titles and descriptions, documentation, error messages, log messages, and identifiers.
 - **Never refer to plan steps by their labels (`M1`, `M1-02`, `M2-05`) in commit messages or PR descriptions.** Call them by name, for example "framing and the ReadyForQuery state machine" or "time and I/O abstraction". The labels are for use inside the design documents only.
-- Use the vocabulary from the design document glossary (chapter 9): client connection, server connection, connection slot (接続枠), grant (払い出し), reclaim (回収), arbitration (調停), convergence (収束), self-fence (自己フェンス), allocation table (割当表), total budget (総予算).
+- Use the vocabulary from the design document glossary (chapter 9)
 
 ## Design documents
 
@@ -77,3 +77,16 @@ Node-local config (role, listener, coordinator entry point, client-connection ca
 - Move into a worktree with `git wt <branch>` before changing anything.
 - For each step, write the tests first, confirm they fail because nothing is implemented, then implement. Do not change the tests while implementing.
 - Do not write code comments.
+- **Before every push, run the same checks CI runs, locally, and push only if all of them pass.** CI's clippy uses the current stable toolchain, so run `rustup update stable` first if the local toolchain is behind.
+
+```bash
+rustup update stable
+cargo fmt --all --check
+RUSTFLAGS="-D warnings" cargo clippy --workspace --all-features --all-targets
+cargo deny check
+cargo test --workspace --all-features --exclude pgsteward-sim-tests --exclude pgsteward-integration-tests
+cargo test -p pgsteward-sim-tests --all-features
+cargo test -p pgsteward-integration-tests        # needs Docker
+```
+
+`cargo audit` also runs in CI; run it too when it is installed locally.
