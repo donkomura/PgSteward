@@ -1,3 +1,4 @@
+use std::future::{Future, ready};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,13 +9,14 @@ use pgsteward_harness::cap::{CapMonitor, ObserveConnections, ObserveError};
 struct Scripted(Arc<Mutex<Vec<usize>>>);
 
 impl ObserveConnections for Scripted {
-    async fn observe(&self) -> Result<usize, ObserveError> {
+    fn observe(&self) -> impl Future<Output = Result<usize, ObserveError>> + Send {
         let mut samples = self.0.lock().unwrap();
-        Ok(if samples.len() > 1 {
+        let next = if samples.len() > 1 {
             samples.remove(0)
         } else {
             samples[0]
-        })
+        };
+        ready(Ok(next))
     }
 }
 

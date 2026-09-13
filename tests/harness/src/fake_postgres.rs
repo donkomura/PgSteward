@@ -1,3 +1,4 @@
+use std::future::{Future, ready};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,8 +49,8 @@ impl Drop for LiveGuard {
 }
 
 impl ObserveConnections for FakePostgresStats {
-    async fn observe(&self) -> Result<usize, ObserveError> {
-        Ok(self.live())
+    fn observe(&self) -> impl Future<Output = Result<usize, ObserveError>> + Send {
+        ready(Ok(self.live()))
     }
 }
 
