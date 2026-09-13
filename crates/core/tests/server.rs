@@ -4,7 +4,8 @@ use bytes::{BufMut, BytesMut};
 use hmac::{Hmac, KeyInit, Mac};
 use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::server::{
-    ApplicationName, ConnectError, HandshakeError, ServerConnection, ServerCredentials, connect,
+    ApplicationName, ConnectError, HandshakeError, QueryError, ServerConnection, ServerCredentials,
+    SimpleQuery, connect,
 };
 use pgsteward_protocol::framing::{Frame, decode_frame, decode_startup_frame, encode_frame};
 use pgsteward_protocol::startup::{
@@ -775,4 +776,169 @@ fn credentials_debug_output_redacts_the_password() {
     let text = format!("{:?}", credentials(Some("hunter2")));
     assert!(text.contains("app_web"), "{text}");
     assert!(!text.contains("hunter2"), "{text}");
+}
+
+fn row_description(names: &[&str]) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_i16(i16::try_from(names.len()).unwrap());
+    for name in names {
+        body.put_slice(name.as_bytes());
+        body.put_u8(0);
+        body.put_i32(0);
+        body.put_i16(0);
+        body.put_i32(25);
+        body.put_i16(-1);
+        body.put_i32(-1);
+        body.put_i16(0);
+    }
+    frame(b'T', &body)
+}
+
+fn data_row(values: &[Option<&str>]) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_i16(i16::try_from(values.len()).unwrap());
+    for value in values {
+        match value {
+            Some(text) => {
+                body.put_i32(i32::try_from(text.len()).unwrap());
+                body.put_slice(text.as_bytes());
+            }
+            None => body.put_i32(-1),
+        }
+    }
+    frame(b'D', &body)
+}
+
+fn command_complete(tag: &str) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_slice(tag.as_bytes());
+    body.put_u8(0);
+    frame(b'C', &body)
+}
+
+#[tokio::test]
+async fn simple_query_returns_every_row_of_the_result() {
+    let (client, mut backend) = pair();
+    let server = tokio::spawn(async move {
+        backend.read_startup().await;
+        backend.send(&successful_startup_tail()).await;
+        let query = backend.read_frame().await;
+        backend
+            .send(
+                &[
+                    row_description(&["name", "setting"]),
+                    data_row(&[Some("max_connections"), Some("200")]),
+                    data_row(&[Some("reserved_connections"), None]),
+                    command_complete("SELECT 2"),
+                    ready_for_query(b'I'),
+                ]
+                .concat(),
+            )
+            .await;
+        query
+    });
+
+    let mut conn =
+        ServerConnection::handshake(client, &credentials(None), &ApplicationName::new("node-1"))
+            .await
+            .unwrap();
+    let rows = conn
+        .simple_query("SELECT name, setting FROM pg_settings")
+        .await
+        .unwrap();
+
+    let query = server.await.unwrap();
+    assert_eq!(query.tag, b'Q');
+    assert_eq!(
+        query.body.as_ref(),
+        b"SELECT name, setting FROM pg_settings\0"
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("max_connections".to_owned()), Some("200".to_owned())],
+            vec![Some("reserved_connections".to_owned()), None],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn simple_query_reports_the_server_error_and_leaves_the_connection_usable() {
+    let (client, mut backend) = pair();
+    tokio::spawn(async move {
+        backend.read_startup().await;
+        backend.send(&successful_startup_tail()).await;
+        backend.read_frame().await;
+        backend
+            .send(
+                &[
+                    error_response("42704", "unrecognized configuration parameter \"nope\""),
+                    ready_for_query(b'I'),
+                ]
+                .concat(),
+            )
+            .await;
+        backend.read_frame().await;
+        backend
+            .send(
+                &[
+                    row_description(&["setting"]),
+                    data_row(&[Some("200")]),
+                    command_complete("SHOW"),
+                    ready_for_query(b'I'),
+                ]
+                .concat(),
+            )
+            .await;
+    });
+
+    let mut conn =
+        ServerConnection::handshake(client, &credentials(None), &ApplicationName::new("node-1"))
+            .await
+            .unwrap();
+
+    let err = conn.simple_query("SHOW nope").await.unwrap_err();
+    match err {
+        QueryError::Server { code, message } => {
+            assert_eq!(code, "42704");
+            assert!(message.contains("nope"), "{message}");
+        }
+        other => panic!("expected a server error, got {other:?}"),
+    }
+
+    let rows = conn.simple_query("SHOW max_connections").await.unwrap();
+    assert_eq!(rows, vec![vec![Some("200".to_owned())]]);
+}
+
+#[tokio::test]
+async fn simple_query_keeps_a_parameter_status_sent_while_it_runs() {
+    let (client, mut backend) = pair();
+    tokio::spawn(async move {
+        backend.read_startup().await;
+        backend.send(&successful_startup_tail()).await;
+        backend.read_frame().await;
+        backend
+            .send(
+                &[
+                    parameter_status("TimeZone", "UTC"),
+                    notice_response("a notice in the middle of a result"),
+                    row_description(&["set_config"]),
+                    data_row(&[Some("UTC")]),
+                    command_complete("SELECT 1"),
+                    ready_for_query(b'I'),
+                ]
+                .concat(),
+            )
+            .await;
+    });
+
+    let mut conn =
+        ServerConnection::handshake(client, &credentials(None), &ApplicationName::new("node-1"))
+            .await
+            .unwrap();
+    conn.simple_query("SELECT set_config('TimeZone', 'UTC', false)")
+        .await
+        .unwrap();
+
+    assert_eq!(conn.parameter("TimeZone"), Some("UTC"));
 }
