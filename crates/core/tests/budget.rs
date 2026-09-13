@@ -1,4 +1,9 @@
-use pgsteward_core::budget::{BudgetInputs, ServerLimits, TotalBudget};
+use std::time::Duration;
+
+use pgsteward_core::budget::{
+    BudgetChange, BudgetInputs, ForeignPeak, InstanceBudget, ServerLimits, TotalBudget,
+};
+use pgsteward_core::rt::Instant;
 use proptest::prelude::*;
 
 fn inputs(
@@ -149,5 +154,165 @@ proptest! {
     #[test]
     fn derivation_is_deterministic(given in arb_inputs()) {
         prop_assert_eq!(TotalBudget::derive(given), TotalBudget::derive(given));
+    }
+}
+
+#[test]
+fn a_peak_without_any_observation_is_zero() {
+    let peak = ForeignPeak::new(Duration::from_secs(60));
+    assert_eq!(peak.peak(), 0);
+}
+
+#[test]
+fn a_rise_takes_the_peak_at_once() {
+    let base = Instant::now();
+    let mut peak = ForeignPeak::new(Duration::from_secs(60));
+    peak.observe(base, 5);
+    peak.observe(base + Duration::from_secs(1), 40);
+    assert_eq!(peak.peak(), 40);
+}
+
+#[test]
+fn the_peak_is_the_largest_observation_in_the_window_not_the_latest() {
+    let base = Instant::now();
+    let mut peak = ForeignPeak::new(Duration::from_secs(60));
+    peak.observe(base, 32);
+    peak.observe(base + Duration::from_secs(10), 20);
+    peak.observe(base + Duration::from_secs(20), 11);
+    assert_eq!(peak.peak(), 32);
+}
+
+#[test]
+fn an_observation_older_than_the_window_no_longer_holds_the_peak() {
+    let base = Instant::now();
+    let mut peak = ForeignPeak::new(Duration::from_secs(60));
+    peak.observe(base, 32);
+    peak.observe(base + Duration::from_secs(10), 20);
+    peak.observe(base + Duration::from_secs(70), 20);
+    assert_eq!(peak.peak(), 20);
+}
+
+fn limits(max_connections: u32) -> ServerLimits {
+    ServerLimits {
+        max_connections,
+        superuser_reserved_connections: 3,
+        reserved_connections: 0,
+    }
+}
+
+#[test]
+fn a_budget_without_any_observation_deducts_no_foreign_connections() {
+    let budget = InstanceBudget::new(limits(200), 15, Duration::from_secs(60));
+    assert_eq!(budget.current().total(), 182);
+    assert_eq!(budget.current().inputs().foreign_peak, 0);
+}
+
+#[test]
+fn foreign_connections_that_appear_shrink_the_budget() {
+    let base = Instant::now();
+    let mut budget = InstanceBudget::new(limits(200), 15, Duration::from_secs(60));
+    assert_eq!(
+        budget.observe(base, 32),
+        BudgetChange::Shrank { from: 182, to: 150 }
+    );
+    assert_eq!(budget.current().total(), 150);
+    assert_eq!(budget.current().inputs().foreign_peak, 32);
+}
+
+#[test]
+fn an_observation_under_the_peak_leaves_the_budget_where_it_is() {
+    let base = Instant::now();
+    let mut budget = InstanceBudget::new(limits(200), 15, Duration::from_secs(60));
+    budget.observe(base, 32);
+    assert_eq!(
+        budget.observe(base + Duration::from_secs(10), 20),
+        BudgetChange::Unchanged
+    );
+    assert_eq!(budget.current().total(), 150);
+}
+
+#[test]
+fn the_budget_grows_once_the_peak_leaves_the_window() {
+    let base = Instant::now();
+    let mut budget = InstanceBudget::new(limits(200), 15, Duration::from_secs(60));
+    budget.observe(base, 32);
+    budget.observe(base + Duration::from_secs(10), 20);
+    assert_eq!(
+        budget.observe(base + Duration::from_secs(70), 20),
+        BudgetChange::Grew { from: 150, to: 162 }
+    );
+}
+
+#[test]
+fn a_resized_server_moves_the_budget_without_a_new_observation() {
+    let base = Instant::now();
+    let mut budget = InstanceBudget::new(limits(200), 15, Duration::from_secs(60));
+    budget.observe(base, 32);
+    assert_eq!(
+        budget.update_limits(limits(400)),
+        BudgetChange::Grew { from: 150, to: 350 }
+    );
+    assert_eq!(budget.current().inputs().limits, limits(400));
+}
+
+#[test]
+fn foreign_connections_beyond_the_server_limits_exhaust_the_budget() {
+    let base = Instant::now();
+    let mut budget = InstanceBudget::new(limits(100), 15, Duration::from_secs(60));
+    budget.observe(base, 90);
+    assert!(budget.current().is_exhausted());
+    assert_eq!(budget.current().shortfall(), 8);
+}
+
+proptest! {
+    #[test]
+    fn the_peak_is_the_largest_observation_the_window_still_holds(
+        observations in prop::collection::vec((1u64..=40, 0u32..=500), 1..40)
+    ) {
+        let window_secs = 60;
+        let base = Instant::now();
+        let mut peak = ForeignPeak::new(Duration::from_secs(window_secs));
+        let mut seen: Vec<(u64, u32)> = Vec::new();
+        let mut elapsed = 0;
+        for (gap, count) in observations {
+            elapsed += gap;
+            peak.observe(base + Duration::from_secs(elapsed), count);
+            seen.push((elapsed, count));
+            let held = seen
+                .iter()
+                .filter(|(at, _)| elapsed - at <= window_secs)
+                .map(|(_, count)| *count)
+                .max()
+                .unwrap_or(0);
+            prop_assert_eq!(peak.peak(), held);
+        }
+    }
+
+    #[test]
+    fn an_observation_never_moves_the_budget_and_the_peak_the_same_way(
+        first in 0u32..=200,
+        second in 0u32..=200,
+    ) {
+        let base = Instant::now();
+        let mut budget = InstanceBudget::new(limits(400), 15, Duration::from_secs(60));
+        budget.observe(base, first);
+        let before = budget.current();
+        let change = budget.observe(base + Duration::from_secs(1), second);
+        let after = budget.current();
+        match change {
+            BudgetChange::Unchanged => {
+                prop_assert_eq!(before.total(), after.total());
+            }
+            BudgetChange::Grew { from, to } => {
+                prop_assert_eq!((from, to), (before.total(), after.total()));
+                prop_assert!(to > from);
+                prop_assert!(after.inputs().foreign_peak < before.inputs().foreign_peak);
+            }
+            BudgetChange::Shrank { from, to } => {
+                prop_assert_eq!((from, to), (before.total(), after.total()));
+                prop_assert!(to < from);
+                prop_assert!(after.inputs().foreign_peak > before.inputs().foreign_peak);
+            }
+        }
     }
 }

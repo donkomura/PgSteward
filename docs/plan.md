@@ -13,7 +13,7 @@ M1 で単体の予算スケジューラを作り、M2 でそれを分散させ�
 | M1-01 足場、時間と入出力の抽象化、テストハーネス | 完了（2026-09-13、PR #1） | workspace と CI、`pgsteward-core::rt`（`Clock` / `Spawner` / `Net`、tokio 実装と turmoil 実装）、`pgsteward-node::config`（2 層の TOML、総予算の項目なし）、`tests/harness`（偽 PostgreSQL、`pg_stat_activity` 監視、`CapMonitor`） |
 | M1-02 フレーミングと ReadyForQuery 状態機械 | 完了（2026-09-13、PR #1） | `pgsteward-protocol::{framing, message, ready}` |
 | M1-03 スタートアップの判別 | 完了（2026-09-13、PR #2） | `pgsteward-protocol::startup`（SSLRequest / GSSENCRequest / CancelRequest / StartupMessage の判別と符号化）、`pgsteward-core::tenant`（`TenantId`） |
-| M1-04 DB 接続の確立と総予算の導出 | 着手（2026-09-13）。1 つの CL には大きいので、総予算の導出（純粋関数、PR #3）→ DB 接続の確立（trust と MD5、PR #4）→ SCRAM 認証（PR #5）→ `SHOW` と `pg_stat_activity` の読み取り（PR #6）→ 他者の接続の観測ピークと導出値の更新、の順に分けて進める。`SHOW` と `pg_stat_activity` の読み取りまで実装済み | `pgsteward-core::budget`（`ServerLimits`、`BudgetInputs`、`TotalBudget`）、`pgsteward-core::server`（`ApplicationName`、`ServerCredentials`、`ServerConnection::handshake`（trust / MD5 / SCRAM-SHA-256）、`connect`、`SimpleQuery`）、`pgsteward-core::inspect`（`read_server_limits`、`read_timeout_settings`、`count_foreign_connections`） |
+| M1-04 DB 接続の確立と総予算の導出 | 完了（2026-09-14、PR #7）。1 つの CL には大きいので、総予算の導出（純粋関数、PR #3）→ DB 接続の確立（trust と MD5、PR #4）→ SCRAM 認証（PR #5）→ `SHOW` と `pg_stat_activity` の読み取り（PR #6）→ 他者の接続の観測ピークと導出値の更新（PR #7）、の順に分けて進めた | `pgsteward-core::budget`（`ServerLimits`、`BudgetInputs`、`TotalBudget`、`ForeignPeak`、`InstanceBudget`、`BudgetChange`）、`pgsteward-core::server`（`ApplicationName`、`ServerCredentials`、`ServerConnection::handshake`（trust / MD5 / SCRAM-SHA-256）、`connect`、`SimpleQuery`）、`pgsteward-core::inspect`（`read_server_limits`、`read_timeout_settings`、`count_foreign_connections`） |
 | M1-05 以降 | 未着手 | |
 
 ## 用語
