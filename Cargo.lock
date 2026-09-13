@@ -1542,6 +1542,7 @@ dependencies = [
  "bytes",
  "pgsteward-protocol",
  "pgsteward-sched",
+ "proptest",
  "thiserror",
  "tokio",
  "tracing",
