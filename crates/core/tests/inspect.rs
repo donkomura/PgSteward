@@ -8,7 +8,7 @@ use pgsteward_core::inspect::{
 };
 use pgsteward_core::server::{ApplicationName, QueryError, Row, SimpleQuery};
 
-const UNRECOGNIZED_PARAMETER: &str = "42704";
+const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
 
 #[derive(Debug, Default)]
 struct FakeServer {
@@ -55,7 +55,7 @@ impl FakeServer {
                 message: message.clone(),
             }),
             None => Err(QueryError::Server {
-                code: UNRECOGNIZED_PARAMETER.to_owned(),
+                code: SQLSTATE_UNDEFINED_OBJECT.to_owned(),
                 message: format!("unrecognized configuration parameter \"{setting}\""),
             }),
         }

@@ -3,7 +3,11 @@ use std::time::Duration;
 use crate::budget::ServerLimits;
 use crate::server::{ApplicationName, QueryError, Row, SimpleQuery};
 
-const UNRECOGNIZED_PARAMETER: &str = "42704";
+// A server answers SHOW for a setting it does not have with SQLSTATE 42704
+// (undefined_object). reserved_connections is one of those below PostgreSQL 16,
+// so only this code means "this server has no such setting"; every other server
+// error is passed on.
+const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
 const FOREIGN_CONNECTIONS: &str = "the number of foreign connections";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -61,6 +65,9 @@ pub async fn read_timeout_settings<Q: SimpleQuery>(
     })
 }
 
+/// Counts the client backends this system did not open. The total budget is
+/// derived by subtracting the peak of this count, because how many connections
+/// an administrator's psql or a monitoring agent takes is in no configuration.
 pub async fn count_foreign_connections<Q: SimpleQuery>(
     server: &mut Q,
 ) -> Result<u32, InspectError> {
@@ -80,7 +87,7 @@ async fn show<Q: SimpleQuery>(
 ) -> Result<String, InspectError> {
     let rows = match server.simple_query(&format!("SHOW {setting}")).await {
         Ok(rows) => rows,
-        Err(QueryError::Server { code, .. }) if code == UNRECOGNIZED_PARAMETER => {
+        Err(QueryError::Server { code, .. }) if code == SQLSTATE_UNDEFINED_OBJECT => {
             return Err(InspectError::Missing(setting));
         }
         Err(error) => return Err(error.into()),
