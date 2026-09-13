@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::io;
 
 use bytes::BytesMut;
@@ -9,7 +10,9 @@ use pgsteward_protocol::startup::{
 };
 use postgres_protocol::authentication::md5_hash;
 use postgres_protocol::authentication::sasl::{ChannelBinding, SCRAM_SHA_256, ScramSha256};
-use postgres_protocol::message::backend::{AuthenticationSaslBody, ErrorFields, Message};
+use postgres_protocol::message::backend::{
+    AuthenticationSaslBody, DataRowBody, ErrorFields, Message,
+};
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -81,6 +84,18 @@ pub enum HandshakeError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    #[error("i/o error while running a query: {0}")]
+    Io(#[from] io::Error),
+    #[error("server refused the query ({code}): {message}")]
+    Server { code: String, message: String },
+    #[error("protocol violation while running a query: {0}")]
+    UnexpectedMessage(&'static str),
+    #[error("server closed the connection while running a query")]
+    ConnectionClosed,
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     #[error("cannot reach the server: {0}")]
     Unreachable(io::Error),
@@ -88,9 +103,19 @@ pub enum ConnectError {
     Handshake(#[from] HandshakeError),
 }
 
+pub type Row = Vec<Option<String>>;
+
+pub trait SimpleQuery {
+    fn simple_query(
+        &mut self,
+        sql: &str,
+    ) -> impl Future<Output = Result<Vec<Row>, QueryError>> + Send;
+}
+
 #[derive(Debug)]
 pub struct ServerConnection<S> {
     stream: S,
+    read_buf: BytesMut,
     parameters: BTreeMap<String, String>,
     backend_key: CancelKey,
 }
@@ -126,6 +151,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
                     let backend_key = startup.ready(body.status())?;
                     return Ok(Self {
                         stream,
+                        read_buf,
                         parameters: startup.parameters,
                         backend_key,
                     });
@@ -183,6 +209,47 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
         })
         .await?;
         self.stream.shutdown().await
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> SimpleQuery for ServerConnection<S> {
+    async fn simple_query(&mut self, sql: &str) -> Result<Vec<Row>, QueryError> {
+        send(&mut self.stream, |buf| frontend::query(sql, buf)).await?;
+
+        let mut rows = Vec::new();
+        let mut refusal = None;
+        loop {
+            match read_message(&mut self.stream, &mut self.read_buf).await? {
+                Message::ReadyForQuery(_) => {
+                    return refusal.map_or(Ok(rows), Err);
+                }
+                Message::DataRow(body) => rows.push(row_values(&body)?),
+                Message::RowDescription(_)
+                | Message::CommandComplete(_)
+                | Message::EmptyQueryResponse => {}
+                Message::ErrorResponse(body) => {
+                    refusal = Some(QueryError::Server {
+                        code: error_field(body.fields(), SQLSTATE_FIELD),
+                        message: error_field(body.fields(), MESSAGE_FIELD),
+                    });
+                }
+                Message::NoticeResponse(body) => {
+                    tracing::debug!(
+                        notice = %error_field(body.fields(), MESSAGE_FIELD),
+                        "notice while running a query"
+                    );
+                }
+                Message::ParameterStatus(body) => {
+                    self.parameters
+                        .insert(body.name()?.to_owned(), body.value()?.to_owned());
+                }
+                _ => {
+                    return Err(QueryError::UnexpectedMessage(
+                        "message other than a row, a completion, ParameterStatus, NoticeResponse, ErrorResponse or ReadyForQuery in a simple query result",
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -345,16 +412,49 @@ fn startup_request(
 async fn read_message<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
-) -> Result<Message, HandshakeError> {
+) -> Result<Message, ReadError> {
     loop {
-        if let Some(message) = Message::parse(buf)? {
+        if let Some(message) = Message::parse(buf).map_err(ReadError::Io)? {
             return Ok(message);
         }
         buf.reserve(READ_CHUNK);
-        if stream.read_buf(buf).await? == 0 {
-            return Err(HandshakeError::ConnectionClosed);
+        if stream.read_buf(buf).await.map_err(ReadError::Io)? == 0 {
+            return Err(ReadError::Closed);
         }
     }
+}
+
+enum ReadError {
+    Io(io::Error),
+    Closed,
+}
+
+impl From<ReadError> for HandshakeError {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::Io(source) => Self::Io(source),
+            ReadError::Closed => Self::ConnectionClosed,
+        }
+    }
+}
+
+impl From<ReadError> for QueryError {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::Io(source) => Self::Io(source),
+            ReadError::Closed => Self::ConnectionClosed,
+        }
+    }
+}
+
+fn row_values(body: &DataRowBody) -> Result<Row, QueryError> {
+    let buffer = body.buffer();
+    let mut ranges = body.ranges();
+    let mut values = Vec::new();
+    while let Some(range) = ranges.next()? {
+        values.push(range.map(|range| String::from_utf8_lossy(&buffer[range]).into_owned()));
+    }
+    Ok(values)
 }
 
 async fn send<S: AsyncWrite + Unpin>(
