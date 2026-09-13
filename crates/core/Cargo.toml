@@ -1,0 +1,27 @@
+[package]
+name = "pgsteward-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+turmoil = ["dep:turmoil"]
+
+[dependencies]
+pgsteward-protocol.workspace = true
+pgsteward-sched.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+turmoil = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+turmoil.workspace = true
+
+[lints]
+workspace = true
