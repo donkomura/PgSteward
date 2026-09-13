@@ -6,6 +6,15 @@ M1 で単体の予算スケジューラを作り、M2 でそれを分散させ�
 
 本書では契約も決定も**名前で呼ぶ**。読むときに記号を引き直さなくて済むようにするためである。
 
+## 進捗
+
+| ステップ | 状態 | 成果物 |
+|---|---|---|
+| M1-01 足場、時間と入出力の抽象化、テストハーネス | 完了（2026-09-13、PR #1） | workspace と CI、`pgsteward-core::rt`（`Clock` / `Spawner` / `Net`、tokio 実装と turmoil 実装）、`pgsteward-node::config`（2 層の TOML、総予算の項目なし）、`tests/harness`（偽 PostgreSQL、`pg_stat_activity` 監視、`CapMonitor`） |
+| M1-02 フレーミングと ReadyForQuery 状態機械 | 完了（2026-09-13、PR #1） | `pgsteward-protocol::{framing, message, ready}` |
+| M1-03 スタートアップの判別 | 着手（2026-09-13） | `pgsteward-protocol::startup`（SSLRequest / GSSENCRequest / CancelRequest / StartupMessage の判別と符号化）、`pgsteward-core::tenant`（`TenantId`） |
+| M1-04 以降 | 未着手 | |
+
 ## 用語
 
 design-doc 9 章の用語集に揃える。ここには実装で頻出するものだけを再掲する。
@@ -120,7 +129,7 @@ M1-06 で初めて psql が繋がり、M1-08 でプーラーになり、**M1-10 
 |---|---|---|
 | **M1-01** | **足場、時間と入出力の抽象化、テストハーネス。** workspace、CI、ノードローカル設定とクラスタ設定の TOML スキーマ（総予算は項目に持たない）。`rt` の `Clock` / `Spawner` / `Net` トレイトと、tokio 実装 / turmoil 実装の 2 つ。偽 PostgreSQL と `pg_stat_activity` 監視、両者に共通の接続上限アサーション。抽象は `rt` モジュールに閉じ込め、呼び出し側は `rt` 越しにしか時計・タスク・ネットワークを触れない形にして、素朴に書けなくなる範囲を狭める。**このステップを削ると「決定的シミュレーションとモデル検査で正しさを示す決定」が成立しない** | 接続上限の計測基盤、起動時の設定検証 |
 | M1-02 | フレーミングと ReadyForQuery 状態機械。入出力を持たない純粋関数 | simple query とトランザクションモードの基盤、トランザクション不可分 |
-| M1-03 | スタートアップの判別。SSLRequest / CancelRequest / StartupMessage を見分け、テナントに解決 | スタートアップ、テナント解決と認証 |
+| M1-03 | スタートアップの判別。SSLRequest / GSSENCRequest / CancelRequest / StartupMessage を見分け、テナントに解決。テナントの識別子は StartupMessage の `user` と `database`（省略時は `user` と同じ、PostgreSQL の既定に従う）から作る。**この識別子とクラスタ設定の `[tenant."…"]` の対応づけは M1-10 で行う** — 設定の鍵の書式（`user` だけか `user@database` か）は design-doc 14.1 で未定なので、そこで決める。GSSENCRequest は SSLRequest と同じく判別だけ行い、応答の方針（`N` を返す）は M1-05 で入れる | スタートアップ、テナント解決と認証 |
 | M1-04 | DB 接続の確立と総予算の導出。SCRAM / MD5、ParameterStatus と BackendKeyData の保持、`application_name` に識別子。**`SHOW max_connections` / `superuser_reserved_connections` / `reserved_connections` を読み、`pg_stat_activity` で他者の接続を観測して、インスタンスごとの総予算を導出する**。`tcp_keepalives_idle` と `tcp_user_timeout` の検証もここで読む | 起動時の設定検証、総予算の導出、パラメータ通知の DB 側 |
 | M1-05 | クライアント認証。**この時点で DB 接続も接続枠も消費しない** | 認証、接続受け入れ時に資源を消費しない |
 | **M1-06** | **セッションモードの透過プロキシ。** クライアント接続と DB 接続を 1 対 1 に結び、双方向にバイト列を流す。**ここで初めて psql で SELECT が動く** | simple query、エラーの透過、セッションモード |
