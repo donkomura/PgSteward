@@ -1,4 +1,7 @@
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use bytes::{BufMut, BytesMut};
+use hmac::{Hmac, KeyInit, Mac};
 use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::server::{
     ApplicationName, ConnectError, HandshakeError, ServerConnection, ServerCredentials, connect,
@@ -7,6 +10,7 @@ use pgsteward_protocol::framing::{Frame, decode_frame, decode_startup_frame, enc
 use pgsteward_protocol::startup::{
     CancelKey, ProtocolVersion, StartupMessage, StartupRequest, decode_startup,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 const MAX_FRAME: usize = 1 << 20;
@@ -247,6 +251,310 @@ async fn cleartext_password_authentication_is_not_supported() {
         "{err:?}"
     );
     assert!(err.to_string().contains("cleartext"), "{err}");
+    assert!(server.await.unwrap().is_empty());
+}
+
+const SCRAM_SALT: &[u8] = b"pgsteward-salt16";
+const SCRAM_ITERATIONS: u32 = 4096;
+const SERVER_NONCE: &str = "3rfcNHYJY1ZVvWVs7j";
+const FORGED_SIGNATURE: &str = "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+fn authentication_sasl(mechanisms: &[&str]) -> Vec<u8> {
+    let mut rest = BytesMut::new();
+    for mechanism in mechanisms {
+        rest.put_slice(mechanism.as_bytes());
+        rest.put_u8(0);
+    }
+    rest.put_u8(0);
+    authentication(10, &rest)
+}
+
+fn authentication_sasl_continue(data: &str) -> Vec<u8> {
+    authentication(11, data.as_bytes())
+}
+
+fn authentication_sasl_final(data: &str) -> Vec<u8> {
+    authentication(12, data.as_bytes())
+}
+
+fn split_sasl_initial_response(body: &[u8]) -> (String, String) {
+    let nul = body.iter().position(|byte| *byte == 0).unwrap();
+    let mechanism = String::from_utf8(body[..nul].to_vec()).unwrap();
+    let rest = &body[nul + 1..];
+    let declared = i32::from_be_bytes(rest[..4].try_into().unwrap());
+    let data = String::from_utf8(rest[4..].to_vec()).unwrap();
+    assert_eq!(usize::try_from(declared).unwrap(), data.len());
+    (mechanism, data)
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+fn salted_password(password: &str) -> [u8; 32] {
+    let mut block = Vec::from(SCRAM_SALT);
+    block.extend_from_slice(&1i32.to_be_bytes());
+    let mut previous = hmac_sha256(password.as_bytes(), &block);
+    let mut salted = previous;
+    for _ in 1..SCRAM_ITERATIONS {
+        previous = hmac_sha256(password.as_bytes(), &previous);
+        for (byte, next) in salted.iter_mut().zip(previous) {
+            *byte ^= next;
+        }
+    }
+    salted
+}
+
+struct ScramExchange {
+    client_first_bare: String,
+    server_first: String,
+}
+
+impl ScramExchange {
+    fn start(client_first: &str) -> Self {
+        let client_first_bare = client_first
+            .strip_prefix("n,,")
+            .expect("a client without channel binding announces it with the n,, header")
+            .to_owned();
+        let client_nonce = client_first_bare.split(",r=").nth(1).unwrap().to_owned();
+        let server_first = format!(
+            "r={client_nonce}{SERVER_NONCE},s={},i={SCRAM_ITERATIONS}",
+            STANDARD.encode(SCRAM_SALT)
+        );
+        Self {
+            client_first_bare,
+            server_first,
+        }
+    }
+
+    fn finish(&self, client_final: &str, password: &str) -> String {
+        let (without_proof, proof) = client_final.rsplit_once(",p=").unwrap();
+        let auth_message = format!(
+            "{},{},{without_proof}",
+            self.client_first_bare, self.server_first
+        );
+        let salted = salted_password(password);
+
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key: [u8; 32] = Sha256::digest(client_key).into();
+        let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let expected: Vec<u8> = client_key
+            .iter()
+            .zip(client_signature)
+            .map(|(key, signature)| key ^ signature)
+            .collect();
+        assert_eq!(STANDARD.decode(proof).unwrap(), expected, "client proof");
+
+        let server_key = hmac_sha256(&salted, b"Server Key");
+        format!(
+            "v={}",
+            STANDARD.encode(hmac_sha256(&server_key, auth_message.as_bytes()))
+        )
+    }
+}
+
+struct ScramTranscript {
+    mechanism: String,
+    client_first: String,
+    client_final: String,
+}
+
+async fn scram_up_to_the_client_proof(
+    backend: &mut Backend,
+    mechanisms: &[&str],
+    password: &str,
+) -> (ScramTranscript, String) {
+    backend.send(&authentication_sasl(mechanisms)).await;
+
+    let initial = backend.read_frame().await;
+    assert_eq!(initial.tag, b'p');
+    let (mechanism, client_first) = split_sasl_initial_response(initial.body.as_ref());
+    let exchange = ScramExchange::start(&client_first);
+    backend
+        .send(&authentication_sasl_continue(&exchange.server_first))
+        .await;
+
+    let response = backend.read_frame().await;
+    assert_eq!(response.tag, b'p');
+    let client_final = String::from_utf8(response.body.to_vec()).unwrap();
+    let server_final = exchange.finish(&client_final, password);
+    (
+        ScramTranscript {
+            mechanism,
+            client_first,
+            client_final,
+        },
+        server_final,
+    )
+}
+
+async fn run_scram(backend: &mut Backend, mechanisms: &[&str], password: &str) -> ScramTranscript {
+    let (transcript, server_final) =
+        scram_up_to_the_client_proof(backend, mechanisms, password).await;
+    backend
+        .send(&authentication_sasl_final(&server_final))
+        .await;
+    backend.send(&successful_startup_tail()).await;
+    transcript
+}
+
+#[tokio::test]
+async fn handshake_completes_the_scram_sha_256_exchange() {
+    let (client, mut backend) = pair();
+    let server = tokio::spawn(async move {
+        backend.read_startup().await;
+        run_scram(&mut backend, &["SCRAM-SHA-256"], "secret").await
+    });
+
+    let conn = ServerConnection::handshake(
+        client,
+        &credentials(Some("secret")),
+        &ApplicationName::new("node-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(conn.parameter("server_version"), Some("16.4"));
+
+    let transcript = server.await.unwrap();
+    assert_eq!(transcript.mechanism, "SCRAM-SHA-256");
+    assert!(
+        transcript.client_first.starts_with("n,,n=,r="),
+        "{}",
+        transcript.client_first
+    );
+    assert!(
+        transcript.client_final.starts_with("c=biws,r="),
+        "{}",
+        transcript.client_final
+    );
+}
+
+#[tokio::test]
+async fn channel_binding_is_declined_while_the_db_side_runs_without_tls() {
+    let (client, mut backend) = pair();
+    let server = tokio::spawn(async move {
+        backend.read_startup().await;
+        run_scram(
+            &mut backend,
+            &["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"],
+            "secret",
+        )
+        .await
+    });
+
+    ServerConnection::handshake(
+        client,
+        &credentials(Some("secret")),
+        &ApplicationName::new("node-1"),
+    )
+    .await
+    .unwrap();
+
+    let transcript = server.await.unwrap();
+    assert_eq!(transcript.mechanism, "SCRAM-SHA-256");
+    assert!(
+        transcript.client_first.starts_with("n,,"),
+        "{}",
+        transcript.client_first
+    );
+}
+
+#[tokio::test]
+async fn a_forged_server_signature_fails_the_handshake() {
+    let (client, mut backend) = pair();
+    let server = tokio::spawn(async move {
+        backend.read_startup().await;
+        scram_up_to_the_client_proof(&mut backend, &["SCRAM-SHA-256"], "secret").await;
+        backend
+            .send(&authentication_sasl_final(FORGED_SIGNATURE))
+            .await;
+        backend.read_to_end().await
+    });
+
+    let err = ServerConnection::handshake(
+        client,
+        &credentials(Some("secret")),
+        &ApplicationName::new("node-1"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, HandshakeError::Scram(_)), "{err:?}");
+    assert!(server.await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn authentication_ok_before_the_scram_proof_is_a_protocol_violation() {
+    let (client, mut backend) = pair();
+    tokio::spawn(async move {
+        backend.read_startup().await;
+        backend.send(&authentication_sasl(&["SCRAM-SHA-256"])).await;
+        backend.read_frame().await;
+        backend.send(&successful_startup_tail()).await;
+    });
+
+    let err = ServerConnection::handshake(
+        client,
+        &credentials(Some("secret")),
+        &ApplicationName::new("node-1"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, HandshakeError::UnexpectedMessage(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn scram_without_a_configured_password_is_refused_and_nothing_more_is_sent() {
+    let (client, mut backend) = pair();
+    let server = tokio::spawn(async move {
+        backend.read_startup().await;
+        backend.send(&authentication_sasl(&["SCRAM-SHA-256"])).await;
+        backend.read_to_end().await
+    });
+
+    let err =
+        ServerConnection::handshake(client, &credentials(None), &ApplicationName::new("node-1"))
+            .await
+            .unwrap_err();
+
+    assert!(
+        matches!(err, HandshakeError::PasswordRequired(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("SCRAM-SHA-256"), "{err}");
+    assert!(server.await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sasl_without_scram_sha_256_is_not_supported() {
+    let (client, mut backend) = pair();
+    let server = tokio::spawn(async move {
+        backend.read_startup().await;
+        backend
+            .send(&authentication_sasl(&["SCRAM-SHA-256-PLUS"]))
+            .await;
+        backend.read_to_end().await
+    });
+
+    let err = ServerConnection::handshake(
+        client,
+        &credentials(Some("secret")),
+        &ApplicationName::new("node-1"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, HandshakeError::UnsupportedAuthentication(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("SCRAM-SHA-256"), "{err}");
     assert!(server.await.unwrap().is_empty());
 }
 
