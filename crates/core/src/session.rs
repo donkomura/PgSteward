@@ -1,20 +1,26 @@
 use std::fmt;
 use std::io;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use pgsteward_protocol::backend::{
-    EncryptionResponse, ErrorResponse, encode_authentication_ok, encode_encryption_response,
-    encode_error_response, sqlstate,
+    EncryptionResponse, ErrorResponse, encode_authentication_ok, encode_authentication_sasl,
+    encode_authentication_sasl_continue, encode_authentication_sasl_final,
+    encode_encryption_response, encode_error_response, sqlstate,
 };
-use pgsteward_protocol::framing::{FrameError, decode_startup_frame};
+use pgsteward_protocol::framing::{Frame, FrameError, decode_frame, decode_startup_frame};
+use pgsteward_protocol::frontend::{FrontendError, decode_sasl_initial_response};
+use pgsteward_protocol::message::FrontendTag;
 use pgsteward_protocol::startup::{
     CancelKey, SUPPORTED_MAJOR, StartupError, StartupMessage, StartupRequest, decode_startup,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::auth::{AuthMethod, Credentials};
+use crate::scram::{MECHANISM, ScramError, ScramExchange, ScramVerifier, nonce};
 use crate::tenant::{TenantId, TenantResolveError};
 
 const MAX_STARTUP_PACKET: usize = 10_000;
+const MAX_AUTH_MESSAGE: usize = 10_000;
 const READ_CHUNK: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,6 +52,16 @@ pub enum AcceptError {
     Tenant(TenantResolveError),
     #[error("the client asked for {0} encryption twice")]
     RepeatedEncryptionRequest(Encryption),
+    #[error("malformed SASL message: {0}")]
+    Frontend(#[from] FrontendError),
+    #[error("the client asked for the {0:?} SASL mechanism; this node offers {MECHANISM}")]
+    UnsupportedMechanism(String),
+    #[error("the client sent {:?} where a SASL response was expected", *.0 as char)]
+    UnexpectedMessage(u8),
+    #[error("{MECHANISM} exchange failed: {0}")]
+    Scram(ScramError),
+    #[error("password authentication failed for user {0:?}")]
+    AuthenticationFailed(String),
 }
 
 impl AcceptError {
@@ -67,9 +83,22 @@ impl AcceptError {
                 )
                 .with_hint("Name the user in the connection string."),
             ),
-            Self::Frame(_) | Self::RepeatedEncryptionRequest(_) | Self::Startup(_) => Some(
-                ErrorResponse::fatal(sqlstate::PROTOCOL_VIOLATION, self.to_string()),
+            Self::UnsupportedMechanism(_) | Self::Scram(ScramError::ChannelBinding) => Some(
+                ErrorResponse::fatal(sqlstate::FEATURE_NOT_SUPPORTED, self.to_string()),
             ),
+            Self::AuthenticationFailed(user) => Some(ErrorResponse::fatal(
+                sqlstate::INVALID_PASSWORD,
+                format!("password authentication failed for user {user:?}"),
+            )),
+            Self::Frame(_)
+            | Self::RepeatedEncryptionRequest(_)
+            | Self::Startup(_)
+            | Self::Frontend(_)
+            | Self::UnexpectedMessage(_)
+            | Self::Scram(_) => Some(ErrorResponse::fatal(
+                sqlstate::PROTOCOL_VIOLATION,
+                self.to_string(),
+            )),
         }
     }
 }
@@ -110,8 +139,9 @@ impl<S> ClientSession<S> {
     }
 }
 
-pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn accept<S: AsyncRead + AsyncWrite + Unpin, C: Credentials>(
     mut stream: S,
+    credentials: C,
 ) -> Result<Accepted<S>, AcceptError> {
     let mut pending = BytesMut::with_capacity(READ_CHUNK);
     let mut asked = Negotiation::default();
@@ -131,6 +161,10 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
                         return Err(refuse(&mut stream, AcceptError::Tenant(error)).await);
                     }
                 };
+                let method = credentials.method(&tenant);
+                if let Err(error) = authenticate(&mut stream, &mut pending, method, &tenant).await {
+                    return Err(refuse(&mut stream, error).await);
+                }
                 write(&mut stream, encode_authentication_ok).await?;
                 return Ok(Accepted::Session(ClientSession {
                     stream,
@@ -148,6 +182,88 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
             encode_encryption_response(EncryptionResponse::Refused, out);
         })
         .await?;
+    }
+}
+
+async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    pending: &mut BytesMut,
+    method: Option<AuthMethod>,
+    tenant: &TenantId,
+) -> Result<(), AcceptError> {
+    let verifier = match method {
+        Some(AuthMethod::Trust) => return Ok(()),
+        Some(AuthMethod::ScramSha256(verifier)) => verifier,
+        None => ScramVerifier::mock(),
+    };
+    match scram(stream, pending, verifier).await {
+        Err(AcceptError::Scram(ScramError::Proof)) => {
+            Err(AcceptError::AuthenticationFailed(tenant.user().to_owned()))
+        }
+        outcome => outcome,
+    }
+}
+
+async fn scram<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    pending: &mut BytesMut,
+    verifier: ScramVerifier,
+) -> Result<(), AcceptError> {
+    let mut exchange = ScramExchange::new(verifier, nonce());
+    write(stream, |out| {
+        encode_authentication_sasl(&[MECHANISM], out);
+    })
+    .await?;
+
+    let initial = read_sasl_response(stream, pending).await?;
+    let initial = decode_sasl_initial_response(&initial)?;
+    if initial.mechanism != MECHANISM {
+        return Err(AcceptError::UnsupportedMechanism(
+            initial.mechanism.to_owned(),
+        ));
+    }
+    let server_first = exchange
+        .server_first(initial.data)
+        .map_err(AcceptError::Scram)?;
+    write(stream, |out| {
+        encode_authentication_sasl_continue(&server_first, out);
+    })
+    .await?;
+
+    let client_final = read_sasl_response(stream, pending).await?;
+    let server_final = exchange
+        .server_final(&client_final)
+        .map_err(AcceptError::Scram)?;
+    write(stream, |out| {
+        encode_authentication_sasl_final(&server_final, out);
+    })
+    .await
+    .map_err(AcceptError::from)
+}
+
+async fn read_sasl_response<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    pending: &mut BytesMut,
+) -> Result<Bytes, AcceptError> {
+    let frame = read_frame(stream, pending).await?;
+    if FrontendTag::try_from(frame.tag) != Ok(FrontendTag::Password) {
+        return Err(AcceptError::UnexpectedMessage(frame.tag));
+    }
+    Ok(frame.body)
+}
+
+async fn read_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+) -> Result<Frame, AcceptError> {
+    loop {
+        if let Some(frame) = decode_frame(buf, MAX_AUTH_MESSAGE).map_err(AcceptError::Frame)? {
+            return Ok(frame);
+        }
+        buf.reserve(READ_CHUNK);
+        if stream.read_buf(buf).await? == 0 {
+            return Err(AcceptError::ConnectionClosed);
+        }
     }
 }
 

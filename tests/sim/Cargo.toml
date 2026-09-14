@@ -17,6 +17,7 @@ pgsteward-core = { workspace = true, features = ["turmoil"] }
 pgsteward-harness.workspace = true
 pgsteward-protocol.workspace = true
 bytes.workspace = true
+postgres-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 turmoil.workspace = true

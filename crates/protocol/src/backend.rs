@@ -7,9 +7,13 @@ pub mod sqlstate {
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const PROTOCOL_VIOLATION: &str = "08P01";
     pub const INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
+    pub const INVALID_PASSWORD: &str = "28P01";
 }
 
 const AUTHENTICATION_OK: i32 = 0;
+const AUTHENTICATION_SASL: i32 = 10;
+const AUTHENTICATION_SASL_CONTINUE: i32 = 11;
+const AUTHENTICATION_SASL_FINAL: i32 = 12;
 
 const SEVERITY_FIELD: u8 = b'S';
 const SEVERITY_NON_LOCALIZED_FIELD: u8 = b'V';
@@ -98,6 +102,32 @@ pub fn encode_encryption_response(response: EncryptionResponse, out: &mut BytesM
 pub fn encode_authentication_ok(out: &mut BytesMut) {
     let mut body = BytesMut::new();
     body.put_i32(AUTHENTICATION_OK);
+    encode_frame(BackendTag::Authentication.into(), &body, out);
+}
+
+pub fn encode_authentication_sasl(mechanisms: &[&str], out: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    body.put_i32(AUTHENTICATION_SASL);
+    for mechanism in mechanisms {
+        body.put_slice(mechanism.as_bytes());
+        body.put_u8(0);
+    }
+    body.put_u8(0);
+    encode_frame(BackendTag::Authentication.into(), &body, out);
+}
+
+pub fn encode_authentication_sasl_continue(data: &str, out: &mut BytesMut) {
+    encode_authentication_sasl_data(AUTHENTICATION_SASL_CONTINUE, data, out);
+}
+
+pub fn encode_authentication_sasl_final(data: &str, out: &mut BytesMut) {
+    encode_authentication_sasl_data(AUTHENTICATION_SASL_FINAL, data, out);
+}
+
+fn encode_authentication_sasl_data(kind: i32, data: &str, out: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    body.put_i32(kind);
+    body.put_slice(data.as_bytes());
     encode_frame(BackendTag::Authentication.into(), &body, out);
 }
 

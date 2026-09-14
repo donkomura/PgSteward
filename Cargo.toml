@@ -32,8 +32,11 @@ hmac = "0.13"
 humantime-serde = "1.1"
 postgres-protocol = "0.6"
 proptest = "1.6"
+rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.11"
+stringprep = "0.1"
+subtle = "2.6"
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 thiserror = "2.0"
