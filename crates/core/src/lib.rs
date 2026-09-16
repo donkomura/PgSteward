@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod budget;
 pub mod inspect;
+pub mod pool;
 pub mod relay;
 pub mod rt;
 pub mod scram;
