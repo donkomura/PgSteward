@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pgsteward_core::admission::ClientLimit;
 use pgsteward_core::auth::{AuthMethod, ClientCredentials};
 use pgsteward_core::scram::ScramVerifier;
 use serde::Deserialize;
@@ -81,6 +82,12 @@ impl NodeConfig {
             credentials.insert(user.clone(), AuthMethod::ScramSha256(verifier));
         }
         Ok(credentials)
+    }
+
+    /// How many client connections this node accepts at once.
+    #[must_use]
+    pub fn client_limit(&self) -> ClientLimit {
+        ClientLimit::new(self.node.max_client_connections as usize)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {

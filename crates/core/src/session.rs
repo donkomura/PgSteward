@@ -62,6 +62,8 @@ pub enum AcceptError {
     Scram(ScramError),
     #[error("password authentication failed for user {0:?}")]
     AuthenticationFailed(String),
+    #[error("this node already holds the {max} client connections it accepts")]
+    TooManyClients { max: usize },
 }
 
 impl AcceptError {
@@ -85,6 +87,11 @@ impl AcceptError {
             ),
             Self::UnsupportedMechanism(_) | Self::Scram(ScramError::ChannelBinding) => Some(
                 ErrorResponse::fatal(sqlstate::FEATURE_NOT_SUPPORTED, self.to_string()),
+            ),
+            Self::TooManyClients { .. } => Some(
+                ErrorResponse::fatal(sqlstate::TOO_MANY_CONNECTIONS, self.to_string()).with_hint(
+                    "Raise node.max_client_connections, or spread the clients over more proxy nodes.",
+                ),
             ),
             Self::AuthenticationFailed(user) => Some(ErrorResponse::fatal(
                 sqlstate::INVALID_PASSWORD,
@@ -300,7 +307,24 @@ async fn read_startup<S: AsyncRead + Unpin>(
     }
 }
 
-async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, error: AcceptError) -> AcceptError {
+/// Tells a client the node is full and closes.
+///
+/// The packet the client has already sent is read first. RFC 9293 3.10.4 has a
+/// close with unread data send a reset, and the reset takes the refusal with
+/// it, so the client would never learn why it was turned away.
+pub(crate) async fn refuse_over_limit<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    max: usize,
+) -> AcceptError {
+    let mut pending = BytesMut::with_capacity(READ_CHUNK);
+    let _ = read_startup(stream, &mut pending).await;
+    refuse(stream, AcceptError::TooManyClients { max }).await
+}
+
+pub(crate) async fn refuse<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    error: AcceptError,
+) -> AcceptError {
     if let Some(response) = error.response() {
         let mut out = BytesMut::new();
         encode_error_response(&response, &mut out);
@@ -309,6 +333,7 @@ async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, error: AcceptError) -> Ac
             return error;
         }
         let _ = stream.flush().await;
+        let _ = stream.shutdown().await;
     }
     error
 }
