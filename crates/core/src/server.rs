@@ -202,6 +202,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
         self.backend_key
     }
 
+    #[must_use]
+    pub fn into_parts(self) -> (S, BytesMut) {
+        (self.stream, self.read_buf)
+    }
+
     pub async fn terminate(mut self) -> io::Result<()> {
         send(&mut self.stream, |buf| {
             frontend::terminate(buf);
