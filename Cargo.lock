@@ -1561,7 +1561,9 @@ dependencies = [
 name = "pgsteward-harness"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "pgsteward-core",
+ "pgsteward-protocol",
  "thiserror",
  "tokio",
  "tokio-postgres",

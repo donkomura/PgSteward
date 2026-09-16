@@ -13,6 +13,8 @@ postgres = ["dep:tokio-postgres"]
 
 [dependencies]
 pgsteward-core.workspace = true
+pgsteward-protocol.workspace = true
+bytes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres = { workspace = true, optional = true }
