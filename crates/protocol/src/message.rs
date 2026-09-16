@@ -111,6 +111,16 @@ impl TryFrom<u8> for TransactionStatus {
     }
 }
 
+impl From<TransactionStatus> for u8 {
+    fn from(status: TransactionStatus) -> Self {
+        match status {
+            TransactionStatus::Idle => b'I',
+            TransactionStatus::InTransaction => b'T',
+            TransactionStatus::Failed => b'E',
+        }
+    }
+}
+
 pub fn parse_ready_for_query(body: &[u8]) -> Result<TransactionStatus, MessageError> {
     match body {
         [status] => TransactionStatus::try_from(*status),

@@ -1,7 +1,8 @@
 use bytes::{BufMut, BytesMut};
 
 use crate::framing::encode_frame;
-use crate::message::BackendTag;
+use crate::message::{BackendTag, TransactionStatus};
+use crate::startup::CancelKey;
 
 pub mod sqlstate {
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
@@ -129,6 +130,28 @@ fn encode_authentication_sasl_data(kind: i32, data: &str, out: &mut BytesMut) {
     body.put_i32(kind);
     body.put_slice(data.as_bytes());
     encode_frame(BackendTag::Authentication.into(), &body, out);
+}
+
+pub fn encode_parameter_status(name: &str, value: &str, out: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    body.put_slice(name.as_bytes());
+    body.put_u8(0);
+    body.put_slice(value.as_bytes());
+    body.put_u8(0);
+    encode_frame(BackendTag::ParameterStatus.into(), &body, out);
+}
+
+pub fn encode_backend_key_data(key: CancelKey, out: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    body.put_i32(key.process_id);
+    body.put_i32(key.secret_key);
+    encode_frame(BackendTag::BackendKeyData.into(), &body, out);
+}
+
+pub fn encode_ready_for_query(status: TransactionStatus, out: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    body.put_u8(status.into());
+    encode_frame(BackendTag::ReadyForQuery.into(), &body, out);
 }
 
 pub fn encode_error_response(error: &ErrorResponse, out: &mut BytesMut) {

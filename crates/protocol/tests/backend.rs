@@ -3,8 +3,11 @@ use fallible_iterator::FallibleIterator;
 use pgsteward_protocol::backend::{
     EncryptionResponse, ErrorResponse, Severity, encode_authentication_ok,
     encode_authentication_sasl, encode_authentication_sasl_continue,
-    encode_authentication_sasl_final, encode_encryption_response, encode_error_response, sqlstate,
+    encode_authentication_sasl_final, encode_backend_key_data, encode_encryption_response,
+    encode_error_response, encode_parameter_status, encode_ready_for_query, sqlstate,
 };
+use pgsteward_protocol::message::TransactionStatus;
+use pgsteward_protocol::startup::CancelKey;
 use postgres_protocol::message::backend::{ErrorResponseBody, Message};
 
 fn encoded(encode: impl FnOnce(&mut BytesMut)) -> BytesMut {
@@ -155,4 +158,45 @@ fn authentication_sasl_final_carries_the_server_signature() {
 #[test]
 fn invalid_password_is_the_sqlstate_postgres_uses_for_a_failed_password() {
     assert_eq!(sqlstate::INVALID_PASSWORD, "28P01");
+}
+
+#[test]
+fn a_parameter_status_carries_the_name_and_the_value() {
+    let message = parse(encoded(|out| {
+        encode_parameter_status("server_version", "16.4", out);
+    }));
+    let Message::ParameterStatus(body) = message else {
+        panic!("expected a ParameterStatus");
+    };
+    assert_eq!(body.name().expect("a UTF-8 name"), "server_version");
+    assert_eq!(body.value().expect("a UTF-8 value"), "16.4");
+}
+
+#[test]
+fn backend_key_data_carries_the_process_id_and_the_secret_key() {
+    let key = CancelKey {
+        process_id: 4242,
+        secret_key: 987_654_321,
+    };
+    let message = parse(encoded(|out| encode_backend_key_data(key, out)));
+    let Message::BackendKeyData(body) = message else {
+        panic!("expected a BackendKeyData");
+    };
+    assert_eq!(body.process_id(), key.process_id);
+    assert_eq!(body.secret_key(), key.secret_key);
+}
+
+#[test]
+fn ready_for_query_carries_the_transaction_status() {
+    for (status, byte) in [
+        (TransactionStatus::Idle, b'I'),
+        (TransactionStatus::InTransaction, b'T'),
+        (TransactionStatus::Failed, b'E'),
+    ] {
+        let message = parse(encoded(|out| encode_ready_for_query(status, out)));
+        let Message::ReadyForQuery(body) = message else {
+            panic!("expected a ReadyForQuery");
+        };
+        assert_eq!(body.status(), byte);
+    }
 }

@@ -92,3 +92,15 @@ fn ready_for_query_body_is_one_status_byte() {
         })
     ));
 }
+
+#[test]
+fn transaction_statuses_map_to_and_from_bytes() {
+    for (status, byte) in [
+        (TransactionStatus::Idle, b'I'),
+        (TransactionStatus::InTransaction, b'T'),
+        (TransactionStatus::Failed, b'E'),
+    ] {
+        assert_eq!(TransactionStatus::try_from(byte).unwrap(), status);
+        assert_eq!(u8::from(status), byte);
+    }
+}
