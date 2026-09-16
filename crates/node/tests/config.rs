@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use pgsteward_core::auth::{AuthMethod, Credentials};
+use pgsteward_core::tenant::TenantId;
 use pgsteward_node::config::{ClusterConfig, ConfigError, NodeConfig, PoolMode, Role};
 
 const NODE_LOCAL: &str = r#"
@@ -13,6 +15,9 @@ max_client_connections = 5000
 cert = "/etc/pgsteward/tls.crt"
 key  = "/etc/pgsteward/tls.key"
 "#;
+
+const PENCIL_VERIFIER: &str = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
+WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
 
 const CLUSTER: &str = r#"
 [cluster]
@@ -205,4 +210,73 @@ fn syntax_errors_are_reported_with_location() {
     let err = ClusterConfig::parse("[cluster\npool_mode = 1").unwrap_err();
     assert!(matches!(err, ConfigError::Syntax(_)), "{err}");
     assert!(err.to_string().contains("line 1"), "{err}");
+}
+
+fn with_clients(clients: &str) -> String {
+    format!("{NODE_LOCAL}\n{clients}")
+}
+
+fn one_client(user: &str, verifier: &str) -> String {
+    with_clients(&format!("[client.\"{user}\"]\nverifier = \"{verifier}\"\n"))
+}
+
+#[test]
+fn node_local_config_reads_the_verifier_of_every_client_it_names() {
+    let text = one_client("app_web", PENCIL_VERIFIER);
+
+    let credentials = NodeConfig::parse(&text)
+        .unwrap()
+        .client_credentials()
+        .unwrap();
+
+    assert!(matches!(
+        credentials.method(&TenantId::new("app_web", "shop")),
+        Some(AuthMethod::ScramSha256(_))
+    ));
+    assert!(
+        credentials
+            .method(&TenantId::new("app_report", "shop"))
+            .is_none()
+    );
+}
+
+#[test]
+fn node_local_config_without_clients_names_no_one() {
+    let credentials = NodeConfig::parse(NODE_LOCAL)
+        .unwrap()
+        .client_credentials()
+        .unwrap();
+
+    assert!(
+        credentials
+            .method(&TenantId::new("app_web", "shop"))
+            .is_none()
+    );
+}
+
+#[test]
+fn node_local_config_rejects_a_verifier_it_cannot_read_with_readable_message() {
+    let err = NodeConfig::parse(&one_client("app_web", "hunter2")).unwrap_err();
+
+    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("client.\"app_web\".verifier"), "{message}");
+    assert!(!message.contains("hunter2"), "{message}");
+}
+
+#[test]
+fn node_local_config_rejects_a_plain_password_in_place_of_a_verifier() {
+    let text = with_clients("[client.\"app_web\"]\npassword = \"hunter2\"\n");
+
+    let err = NodeConfig::parse(&text).unwrap_err();
+
+    assert!(err.to_string().contains("password"), "{err}");
+}
+
+#[test]
+fn node_local_config_rejects_a_client_without_a_name() {
+    let err = NodeConfig::parse(&one_client("", PENCIL_VERIFIER)).unwrap_err();
+
+    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+    assert!(err.to_string().contains("client"), "{err}");
 }

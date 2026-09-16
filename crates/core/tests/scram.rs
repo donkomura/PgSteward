@@ -1,10 +1,18 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use pgsteward_core::scram::{DEFAULT_ITERATIONS, ScramError, ScramExchange, ScramVerifier};
+use pgsteward_core::scram::{
+    DEFAULT_ITERATIONS, ScramError, ScramExchange, ScramVerifier, VerifierError,
+};
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 
 const SALT: &[u8] = b"pgsteward-salt-1";
 const SERVER_NONCE: &str = "3rfcNHYJY1ZVvWVs7j";
+// The password "pencil", the salt and the iteration count are the SCRAM-SHA-256 test vector of
+// RFC 7677 section 3 (https://datatracker.ietf.org/doc/html/rfc7677#section-3), written the way
+// PostgreSQL stores a verifier in `pg_authid.rolpassword`.
+const PENCIL_SALT: &str = "W22ZaJ0SNY7soEsUEjb6gQ==";
+const PENCIL_VERIFIER: &str = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
+WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
 
 fn exchange(password: &str) -> ScramExchange {
     ScramExchange::new(
@@ -196,4 +204,96 @@ fn a_mock_verifier_lets_the_exchange_run_to_its_end_and_then_fails_the_proof() {
 #[test]
 fn no_two_mock_verifiers_are_alike() {
     assert_ne!(ScramVerifier::mock(), ScramVerifier::mock());
+}
+
+#[test]
+fn a_verifier_read_from_the_text_postgres_stores_holds_what_the_password_would_have_made() {
+    let salt = STANDARD.decode(PENCIL_SALT).unwrap();
+
+    let parsed: ScramVerifier = PENCIL_VERIFIER.parse().expect("a well-formed verifier");
+
+    assert_eq!(
+        parsed,
+        ScramVerifier::from_password("pencil", &salt, DEFAULT_ITERATIONS)
+    );
+}
+
+#[test]
+fn a_verifier_read_from_text_proves_a_client_that_knows_the_password() {
+    let mut client = client("pencil");
+    let mut exchange =
+        ScramExchange::new(PENCIL_VERIFIER.parse().unwrap(), SERVER_NONCE.to_owned());
+
+    let server_first = exchange.server_first(client.message()).unwrap();
+    client.update(server_first.as_bytes()).unwrap();
+    let server_final = exchange
+        .server_final(client.message())
+        .expect("the client proof matches");
+
+    client
+        .finish(server_final.as_bytes())
+        .expect("the server signature matches");
+}
+
+#[test]
+fn a_verifier_text_that_names_another_mechanism_is_refused() {
+    let error = "md5be86a79bf2043622d58d5453c47d4860"
+        .parse::<ScramVerifier>()
+        .expect_err("this node only reads SCRAM-SHA-256 verifiers");
+
+    assert!(matches!(error, VerifierError::Mechanism), "{error:?}");
+}
+
+#[test]
+fn a_verifier_text_that_is_missing_a_part_is_refused() {
+    let without_keys = PENCIL_VERIFIER.split_once('$').unwrap().0.to_owned() + "$4096:c2FsdA==";
+
+    let error = without_keys
+        .parse::<ScramVerifier>()
+        .expect_err("a verifier names a salt, a stored key and a server key");
+
+    assert!(matches!(error, VerifierError::Malformed(_)), "{error:?}");
+}
+
+#[test]
+fn a_verifier_text_whose_iteration_count_is_not_a_positive_number_is_refused() {
+    for iterations in ["0", "-1", "many"] {
+        let text = PENCIL_VERIFIER.replace("$4096:", &format!("${iterations}:"));
+
+        let error = text
+            .parse::<ScramVerifier>()
+            .expect_err("the iteration count is salted into the password");
+
+        assert!(matches!(error, VerifierError::Iterations), "{error:?}");
+    }
+}
+
+#[test]
+fn a_verifier_text_whose_salt_is_not_base64_is_refused() {
+    let text = PENCIL_VERIFIER.replace(PENCIL_SALT, "not base64");
+
+    let error = text
+        .parse::<ScramVerifier>()
+        .expect_err("the salt is sent to the client as it was stored");
+
+    assert!(matches!(error, VerifierError::Malformed(_)), "{error:?}");
+}
+
+#[test]
+fn a_verifier_text_whose_keys_are_not_the_length_of_a_sha_256_digest_is_refused() {
+    let text = PENCIL_VERIFIER.replace("WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=", "c2hvcnQ=");
+
+    let error = text
+        .parse::<ScramVerifier>()
+        .expect_err("a stored key is a SHA-256 digest");
+
+    assert!(matches!(error, VerifierError::Malformed(_)), "{error:?}");
+}
+
+#[test]
+fn a_verifier_read_from_text_never_prints_the_keys_it_holds() {
+    let printed = format!("{:?}", PENCIL_VERIFIER.parse::<ScramVerifier>().unwrap());
+
+    assert!(printed.contains("ScramVerifier"), "{printed}");
+    assert!(!printed.contains("WG5d8oPm"), "{printed}");
 }

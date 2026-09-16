@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pgsteward_core::auth::{AuthMethod, ClientCredentials};
+use pgsteward_core::scram::ScramVerifier;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +35,14 @@ pub enum Role {
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub node: NodeSection,
+    #[serde(default)]
+    pub client: BTreeMap<String, ClientSection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientSection {
+    pub verifier: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +69,20 @@ impl NodeConfig {
         Ok(config)
     }
 
+    /// The users this node authenticates, read from the `[client."…"]` sections.
+    /// Verifiers are what PostgreSQL stores in `pg_authid.rolpassword`, so that
+    /// no plain password is written into a file this node reads.
+    pub fn client_credentials(&self) -> Result<ClientCredentials, ConfigError> {
+        let mut credentials = ClientCredentials::new();
+        for (user, client) in &self.client {
+            let verifier = client.verifier.parse::<ScramVerifier>().map_err(|source| {
+                ConfigError::invalid(format!("client.\"{user}\".verifier"), source.to_string())
+            })?;
+            credentials.insert(user.clone(), AuthMethod::ScramSha256(verifier));
+        }
+        Ok(credentials)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.node.max_client_connections == 0 {
             return Err(ConfigError::invalid(
@@ -72,6 +96,13 @@ impl NodeConfig {
                 "must name one coordinator entry point",
             ));
         }
+        if self.client.keys().any(|user| user.trim().is_empty()) {
+            return Err(ConfigError::invalid(
+                "client",
+                "a client section must name the user it holds a verifier for",
+            ));
+        }
+        self.client_credentials()?;
         Ok(())
     }
 }
