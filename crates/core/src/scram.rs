@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -26,6 +27,18 @@ pub enum ScramError {
     Proof,
     #[error("a SCRAM message arrived out of order")]
     OutOfOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum VerifierError {
+    #[error(
+        "not a {MECHANISM} verifier; expected `{MECHANISM}$<iterations>:<salt>$<stored key>:<server key>`"
+    )]
+    Mechanism,
+    #[error("malformed {MECHANISM} verifier: {0}")]
+    Malformed(&'static str),
+    #[error("the iteration count of a {MECHANISM} verifier must be a positive number")]
+    Iterations,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -66,6 +79,52 @@ impl ScramVerifier {
             DEFAULT_ITERATIONS,
         )
     }
+}
+
+impl FromStr for ScramVerifier {
+    type Err = VerifierError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let body = text
+            .strip_prefix(MECHANISM)
+            .and_then(|rest| rest.strip_prefix('$'))
+            .ok_or(VerifierError::Mechanism)?;
+        let (parameters, keys) = body.split_once('$').ok_or(VerifierError::Malformed(
+            "no `$` between the salt and the keys",
+        ))?;
+        let (iterations, salt) = parameters.split_once(':').ok_or(VerifierError::Malformed(
+            "no `:` between the iterations and the salt",
+        ))?;
+        let (stored_key, server_key) = keys
+            .split_once(':')
+            .ok_or(VerifierError::Malformed("no `:` between the two keys"))?;
+
+        let iterations: u32 = iterations.parse().map_err(|_| VerifierError::Iterations)?;
+        if iterations == 0 {
+            return Err(VerifierError::Iterations);
+        }
+        let salt = STANDARD
+            .decode(salt)
+            .map_err(|_| VerifierError::Malformed("the salt is not base64"))?;
+        if salt.is_empty() {
+            return Err(VerifierError::Malformed("the salt is empty"));
+        }
+        Ok(Self {
+            salt,
+            iterations,
+            stored_key: key(stored_key, "the stored key is not a base64 SHA-256 digest")?,
+            server_key: key(server_key, "the server key is not a base64 SHA-256 digest")?,
+        })
+    }
+}
+
+fn key(text: &str, complaint: &'static str) -> Result<[u8; KEY_LEN], VerifierError> {
+    let decoded = STANDARD
+        .decode(text)
+        .map_err(|_| VerifierError::Malformed(complaint))?;
+    decoded
+        .try_into()
+        .map_err(|_| VerifierError::Malformed(complaint))
 }
 
 #[must_use]
