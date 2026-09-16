@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod auth;
 pub mod budget;
 pub mod inspect;

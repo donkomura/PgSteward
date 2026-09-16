@@ -9,6 +9,7 @@ pub mod sqlstate {
     pub const PROTOCOL_VIOLATION: &str = "08P01";
     pub const INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
     pub const INVALID_PASSWORD: &str = "28P01";
+    pub const TOO_MANY_CONNECTIONS: &str = "53300";
 }
 
 const AUTHENTICATION_OK: i32 = 0;

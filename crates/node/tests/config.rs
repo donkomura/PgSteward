@@ -280,3 +280,11 @@ fn node_local_config_rejects_a_client_without_a_name() {
     assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
     assert!(err.to_string().contains("client"), "{err}");
 }
+
+#[test]
+fn the_client_connection_limit_comes_from_the_node_local_config() {
+    let config = NodeConfig::parse(NODE_LOCAL).unwrap();
+    let limit = config.client_limit();
+    assert_eq!(limit.max(), 5000);
+    assert_eq!(limit.live(), 0);
+}

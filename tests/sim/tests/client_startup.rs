@@ -1,13 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
+use pgsteward_core::admission::ClientLimit;
 use pgsteward_core::auth::{AuthMethod, Credentials, TrustAll};
 use pgsteward_core::rt::{Net, Spawner, turmoil_rt::TurmoilRuntime};
 use pgsteward_core::scram::{DEFAULT_ITERATIONS, ScramVerifier};
-use pgsteward_core::session::{Accepted, accept};
+use pgsteward_core::session::Accepted;
 use pgsteward_core::tenant::TenantId;
 use pgsteward_harness::fake_postgres::{FakePostgres, FakePostgresStats};
-use pgsteward_protocol::framing::{decode_frame, encode_frame};
+use pgsteward_protocol::framing::{Frame, decode_frame, encode_frame};
 use pgsteward_protocol::startup::{
     ProtocolVersion, StartupMessage, StartupRequest, encode_startup,
 };
@@ -18,6 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_FRAME: usize = 1 << 20;
 const SALT: &[u8] = b"pgsteward-salt-1";
+const MANY_CLIENTS: usize = 16;
+const TOO_MANY_CONNECTIONS: &str = pgsteward_protocol::backend::sqlstate::TOO_MANY_CONNECTIONS;
 
 #[test]
 fn authenticating_a_client_opens_no_server_connection() {
@@ -99,20 +102,35 @@ fn start_proxy<C: Credentials + Clone + Send + 'static>(
     tenants: Arc<Mutex<Vec<String>>>,
     credentials: C,
 ) {
+    start_proxy_with_limit(sim, tenants, credentials, MANY_CLIENTS);
+}
+
+fn start_proxy_with_limit<C: Credentials + Clone + Send + 'static>(
+    sim: &mut turmoil::Sim<'_>,
+    tenants: Arc<Mutex<Vec<String>>>,
+    credentials: C,
+    max_client_connections: usize,
+) {
     sim.host("proxy", move || {
         let tenants = Arc::clone(&tenants);
         let credentials = credentials.clone();
         async move {
             let rt = TurmoilRuntime::new();
+            let limit = ClientLimit::new(max_client_connections);
             let listener = rt.bind("0.0.0.0:6432").await?;
             loop {
                 let (stream, _) = listener.accept().await?;
                 let tenants = Arc::clone(&tenants);
                 let credentials = credentials.clone();
+                let limit = limit.clone();
                 rt.spawn(async move {
-                    if let Ok(Accepted::Session(session)) = accept(stream, credentials).await {
+                    let Ok((_admitted, accepted)) = limit.accept(stream, credentials).await else {
+                        return;
+                    };
+                    if let Accepted::Session(session) = accepted {
                         tenants.lock().unwrap().push(session.tenant().to_string());
                     }
+                    std::future::pending::<()>().await;
                 });
             }
         }
@@ -198,16 +216,20 @@ impl<'a, S: AsyncReadExt + AsyncWriteExt + Unpin> SaslClient<'a, S> {
         self.send(&out).await
     }
 
-    async fn read_message(&mut self) -> turmoil::Result<Message> {
-        let frame = loop {
+    async fn read_frame(&mut self) -> turmoil::Result<Frame> {
+        loop {
             if let Some(frame) = decode_frame(&mut self.buf, MAX_FRAME).unwrap() {
-                break frame;
+                return Ok(frame);
             }
             assert!(
                 self.stream.read_buf(&mut self.buf).await? > 0,
                 "the proxy closed"
             );
-        };
+        }
+    }
+
+    async fn read_message(&mut self) -> turmoil::Result<Message> {
+        let frame = self.read_frame().await?;
         let mut bytes = BytesMut::new();
         encode_frame(frame.tag, &frame.body, &mut bytes);
         Ok(Message::parse(&mut bytes).unwrap().unwrap())
@@ -241,4 +263,58 @@ impl<'a, S: AsyncReadExt + AsyncWriteExt + Unpin> SaslClient<'a, S> {
         ));
         Ok(())
     }
+}
+
+#[test]
+fn a_client_over_the_node_limit_is_refused_and_opens_no_server_connection() {
+    let stats = FakePostgresStats::default();
+    let tenants: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = turmoil::Builder::new().build();
+
+    let db_stats = stats.clone();
+    sim.host("db", move || {
+        let stats = db_stats.clone();
+        async move {
+            let rt = TurmoilRuntime::new();
+            FakePostgres::start(&rt, "0.0.0.0:5432", stats).await?;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    });
+
+    start_proxy_with_limit(&mut sim, Arc::clone(&tenants), TrustAll, 1);
+
+    sim.client("app", async move {
+        let rt = TurmoilRuntime::new();
+        let mut held = rt.connect("proxy:6432").await?;
+        let mut client = SaslClient::new(&mut held);
+        client.send_startup().await?;
+        assert!(matches!(
+            client.read_message().await?,
+            Message::AuthenticationOk
+        ));
+
+        let mut refused = rt.connect("proxy:6432").await?;
+        let mut client = SaslClient::new(&mut refused);
+        client.send_startup().await?;
+        let refusal = client.read_frame().await?;
+        assert_eq!(refusal.tag, b'E');
+        assert!(
+            refusal
+                .body
+                .windows(TOO_MANY_CONNECTIONS.len())
+                .any(|field| field == TOO_MANY_CONNECTIONS.as_bytes()),
+            "the refusal must carry the too_many_connections SQLSTATE"
+        );
+        Ok(())
+    });
+
+    sim.run().unwrap();
+
+    assert_eq!(tenants.lock().unwrap().as_slice(), ["app_web@shop"]);
+    assert_eq!(
+        stats.accepted(),
+        0,
+        "refusing a client must not open a server connection"
+    );
 }
