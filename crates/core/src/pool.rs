@@ -76,13 +76,14 @@ pub struct PoolStats {
     pub idle: usize,
     pub in_use: usize,
     pub opening: usize,
+    pub closing: usize,
     pub waiting: usize,
 }
 
 impl PoolStats {
     #[must_use]
     pub fn actual(&self) -> usize {
-        self.idle + self.in_use
+        self.idle + self.in_use + self.closing
     }
 }
 
@@ -111,11 +112,13 @@ impl<O: OpenServer, K: Clock> Pool<O, K> {
             clock,
             wait_timeout: limits.wait_timeout,
             inner: Arc::new(Inner {
-                slots: limits.slots,
                 state: Mutex::new(State {
+                    slots: limits.slots,
                     idle: Vec::new(),
                     in_use: 0,
                     opening: 0,
+                    closing: 0,
+                    retiring: Vec::new(),
                     waiters: VecDeque::new(),
                     next_ticket: 0,
                 }),
@@ -165,6 +168,21 @@ impl<O: OpenServer, K: Clock> Pool<O, K> {
                     .map_err(|_| PoolError::WaitTimeout { waited })
             }
         }
+    }
+}
+
+impl<O: OpenServer, K: Clock> Pool<O, K>
+where
+    O::Connection: CloseServer,
+{
+    pub async fn converge(&self, grant: usize) -> usize {
+        let retired = self.inner.retire(grant);
+        let closed = retired.len();
+        for connection in retired {
+            connection.close().await;
+        }
+        self.inner.closed(closed);
+        closed
     }
 }
 
@@ -250,16 +268,28 @@ impl<C> fmt::Debug for Assigned<C> {
 }
 
 struct Inner<C> {
-    slots: usize,
     state: Mutex<State<C>>,
 }
 
 struct State<C> {
+    slots: usize,
     idle: Vec<C>,
     in_use: usize,
     opening: usize,
+    closing: usize,
+    retiring: Vec<C>,
     waiters: VecDeque<Waiter<C>>,
     next_ticket: u64,
+}
+
+impl<C> State<C> {
+    fn occupied(&self) -> usize {
+        self.idle.len() + self.in_use + self.opening + self.closing
+    }
+
+    fn over_grant(&self) -> bool {
+        self.idle.len() + self.in_use + self.opening > self.slots
+    }
 }
 
 struct Waiter<C> {
@@ -298,11 +328,59 @@ impl<C> Inner<C> {
     fn stats(&self) -> PoolStats {
         let state = self.lock();
         PoolStats {
-            slots: self.slots,
+            slots: state.slots,
             idle: state.idle.len(),
             in_use: state.in_use,
             opening: state.opening,
+            closing: state.closing,
             waiting: state.waiters.len(),
+        }
+    }
+
+    fn retire(&self, grant: usize) -> Vec<C> {
+        let mut state = self.lock();
+        state.slots = grant;
+        let mut retired = std::mem::take(&mut state.retiring);
+        while state.over_grant() {
+            let Some(connection) = state.idle.pop() else {
+                break;
+            };
+            state.closing += 1;
+            retired.push(connection);
+        }
+        retired
+    }
+
+    fn closed(self: &Arc<Self>, count: usize) {
+        self.lock().closing -= count;
+        self.hand_out();
+    }
+
+    fn hand_out(self: &Arc<Self>) {
+        loop {
+            let mut state = self.lock();
+            if state.waiters.is_empty() {
+                return;
+            }
+            if let Some(connection) = state.idle.pop() {
+                state.in_use += 1;
+                drop(state);
+                release(self, connection);
+                continue;
+            }
+            if state.occupied() >= state.slots {
+                return;
+            }
+            state.opening += 1;
+            let waiter = state
+                .waiters
+                .pop_front()
+                .expect("the queue was not empty under the same lock");
+            drop(state);
+            if let Err(rejected) = waiter.handoff.send(Handoff::Slot(Reservation::new(self))) {
+                rejected.reclaim();
+                self.lock().opening -= 1;
+            }
         }
     }
 
@@ -312,7 +390,7 @@ impl<C> Inner<C> {
             state.in_use += 1;
             return Request::Assigned(Assigned::new(connection, self));
         }
-        if state.in_use + state.opening < self.slots {
+        if state.occupied() < state.slots {
             state.opening += 1;
             return Request::Reserved(Reservation::new(self));
         }
@@ -361,6 +439,10 @@ impl<C> Drop for Reservation<C> {
         }
         loop {
             let mut state = self.pool.lock();
+            if state.over_grant() {
+                state.opening -= 1;
+                return;
+            }
             let Some(waiter) = state.waiters.pop_front() else {
                 state.opening -= 1;
                 return;
@@ -385,6 +467,12 @@ impl<C> Drop for Reservation<C> {
 fn release<C>(pool: &Arc<Inner<C>>, mut connection: C) {
     loop {
         let mut state = pool.lock();
+        if state.over_grant() {
+            state.in_use -= 1;
+            state.closing += 1;
+            state.retiring.push(connection);
+            return;
+        }
         let Some(waiter) = state.waiters.pop_front() else {
             state.in_use -= 1;
             state.idle.push(connection);

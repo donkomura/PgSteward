@@ -159,3 +159,68 @@ fn a_client_that_waits_longer_than_the_timeout_gives_up_its_place() {
     sim.run().unwrap();
     assert_eq!(stats.peak(), 1);
 }
+
+#[test]
+fn a_lowered_grant_is_closed_on_the_instance_before_the_next_client_arrives() {
+    let stats = FakePostgresStats::default();
+    let report: Arc<Mutex<Option<CapReport>>> = Arc::new(Mutex::new(None));
+    let mut sim = turmoil::Builder::new().build();
+    start_db(&mut sim, stats.clone());
+
+    let observed = stats.clone();
+    let capped = Arc::clone(&report);
+    sim.client("app", async move {
+        let rt = TurmoilRuntime::new();
+        let pool = pool(
+            rt,
+            PoolLimits {
+                slots: SLOTS,
+                wait_timeout: Duration::from_secs(5),
+            },
+        );
+
+        let first = pool.acquire().await.unwrap();
+        let second = pool.acquire().await.unwrap();
+        drop(first);
+        drop(second);
+        assert_eq!(observed.live(), SLOTS);
+
+        let closed = pool.converge(1).await;
+
+        assert_eq!(closed, 1);
+        assert_eq!(observed.live(), 1);
+
+        let monitor = CapMonitor::start(&rt, observed.clone(), 1, POLL);
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|_| {
+                let pool = pool.clone();
+                rt.spawn(async move {
+                    let mut assigned = pool.acquire().await.unwrap();
+                    assigned
+                        .simple_query("SELECT pg_backend_pid()")
+                        .await
+                        .unwrap();
+                    rt.sleep(HOLD).await;
+                })
+            })
+            .collect();
+        for client in clients {
+            client.await.unwrap();
+        }
+
+        assert_eq!(pool.stats().actual(), 1);
+        *capped.lock().unwrap() = Some(monitor.stop().await);
+        Ok(())
+    });
+
+    sim.run().unwrap();
+
+    let report = report.lock().unwrap().take().expect("a cap report");
+    report.assert_never_exceeded();
+    assert_eq!(report.peak(), 1);
+    assert_eq!(
+        stats.accepted(),
+        SLOTS,
+        "the clients after the convergence must share the connection that was kept"
+    );
+}

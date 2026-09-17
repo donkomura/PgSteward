@@ -356,3 +356,131 @@ async fn the_slot_of_a_discarded_connection_goes_to_the_waiting_client() {
     assert_eq!(opener.opened(), 2);
     assert_eq!(opener.peak(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_raised_grant_hands_a_slot_to_a_waiting_client() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+    let held = pool.acquire().await.unwrap();
+    let waiting = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.acquire().await }
+    });
+    TokioRuntime::new().sleep(Duration::from_millis(10)).await;
+    assert_eq!(pool.stats().waiting, 1);
+
+    let closed = pool.converge(2).await;
+
+    let served = waiting.await.unwrap().unwrap();
+    assert_eq!(closed, 0);
+    assert_eq!(pool.stats().slots, 2);
+    assert_eq!(opener.opened(), 2);
+    drop(served);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lowered_grant_closes_an_idle_connection() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 2);
+    let first = pool.acquire().await.unwrap();
+    let second = pool.acquire().await.unwrap();
+    drop(first);
+    drop(second);
+    assert_eq!(pool.stats().idle, 2);
+
+    let closed = pool.converge(1).await;
+
+    assert_eq!(closed, 1);
+    assert_eq!(pool.stats().idle, 1);
+    assert_eq!(pool.stats().actual(), 1);
+    assert_eq!(opener.live(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lowered_grant_does_not_interrupt_a_connection_in_use() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 2);
+    let first = pool.acquire().await.unwrap();
+    let second = pool.acquire().await.unwrap();
+
+    let closed = pool.converge(1).await;
+
+    assert_eq!(closed, 0);
+    assert_eq!(pool.stats().in_use, 2);
+    assert_eq!(opener.live(), 2);
+    drop(first);
+    drop(second);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_connection_returned_over_the_grant_is_closed_rather_than_pooled() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 2);
+    let first = pool.acquire().await.unwrap();
+    let second = pool.acquire().await.unwrap();
+    pool.converge(1).await;
+
+    drop(first);
+
+    assert_eq!(pool.stats().idle, 0);
+    assert_eq!(pool.stats().closing, 1);
+    assert_eq!(pool.stats().actual(), 2);
+    assert_eq!(opener.live(), 2);
+
+    let closed = pool.converge(1).await;
+
+    assert_eq!(closed, 1);
+    assert_eq!(pool.stats().closing, 0);
+    assert_eq!(pool.stats().actual(), 1);
+    assert_eq!(opener.live(), 1);
+    drop(second);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_grant_of_zero_leaves_no_slot_for_a_new_client() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+    let held = pool.acquire().await.unwrap();
+    pool.converge(0).await;
+
+    drop(held);
+    assert_eq!(pool.stats().closing, 1);
+
+    let error = pool.acquire().await.unwrap_err();
+
+    assert!(matches!(error, PoolError::WaitTimeout { .. }), "{error:?}");
+    assert_eq!(opener.attempts(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retired_connection_is_closed_before_its_replacement_opens() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+    let held = pool.acquire().await.unwrap();
+    pool.converge(0).await;
+    drop(held);
+
+    let closed = pool.converge(1).await;
+
+    assert_eq!(closed, 1);
+    let next = pool.acquire().await.unwrap();
+    assert_eq!(opener.opened(), 2);
+    assert_eq!(opener.peak(), 1);
+    drop(next);
+}
+
+#[tokio::test(start_paused = true)]
+async fn converging_to_the_grant_the_pool_already_holds_moves_nothing() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 2);
+    let assigned = pool.acquire().await.unwrap();
+    let before = pool.stats();
+
+    let closed = pool.converge(2).await;
+
+    assert_eq!(closed, 0);
+    assert_eq!(pool.stats(), before);
+    assert_eq!(opener.live(), 1);
+    drop(assigned);
+}
