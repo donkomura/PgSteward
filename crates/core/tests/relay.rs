@@ -1,7 +1,7 @@
 use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use pgsteward_core::auth::TrustAll;
-use pgsteward_core::relay::session_mode;
+use pgsteward_core::relay::{Boundary, RelayError, serve_assignment, session_mode};
 use pgsteward_core::server::{ApplicationName, ServerConnection, ServerCredentials};
 use pgsteward_core::session::{Accepted, ClientSession, accept};
 use pgsteward_protocol::framing::{Frame, decode_frame, decode_startup_frame, encode_frame};
@@ -10,6 +10,7 @@ use pgsteward_protocol::startup::{
 };
 use postgres_protocol::message::backend::{ErrorResponseBody, Message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+use tokio::task::JoinHandle;
 
 const MAX_FRAME: usize = 1 << 20;
 const DUPLEX_CAPACITY: usize = 64 * 1024;
@@ -400,4 +401,257 @@ async fn a_server_that_closes_closes_the_client_connection() {
 
     drop(client);
     relay.await.unwrap().unwrap();
+}
+
+type Assignment = (
+    Result<Boundary, RelayError>,
+    BytesMut,
+    ServerConnection<DuplexStream>,
+);
+
+fn client_link() -> (Client, DuplexStream) {
+    let (app, proxy) = duplex(DUPLEX_CAPACITY);
+    (Client::new(app), proxy)
+}
+
+fn spawn_assignment(
+    mut client: DuplexStream,
+    mut pending: BytesMut,
+    mut server: ServerConnection<DuplexStream>,
+) -> JoinHandle<Assignment> {
+    tokio::spawn(async move {
+        let boundary = serve_assignment(&mut client, &mut pending, &mut server).await;
+        (boundary, pending, server)
+    })
+}
+
+fn command_complete(tag: &str, status: u8) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_slice(tag.as_bytes());
+    body.put_u8(0);
+    [frame(b'C', &body), frame(b'Z', &[status])].concat()
+}
+
+async fn expect_query(backend: &mut Backend, sql: &str) {
+    let query = backend.read_frame().await;
+    assert_eq!(query.tag, b'Q');
+    assert_eq!(
+        query.body.as_ref(),
+        [sql.as_bytes(), b"\0"].concat().as_slice()
+    );
+}
+
+async fn expect_complete(client: &mut Client) {
+    assert!(matches!(
+        client.read_message().await,
+        Message::CommandComplete(_)
+    ));
+}
+
+async fn expect_ready(client: &mut Client, status: u8) {
+    let Message::ReadyForQuery(body) = client.read_message().await else {
+        panic!("expected a ReadyForQuery");
+    };
+    assert_eq!(body.status(), status);
+}
+
+#[tokio::test]
+async fn a_simple_query_releases_the_assignment_when_the_server_reports_idle() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("SELECT 1")).await;
+    expect_query(&mut backend, "SELECT 1").await;
+    backend.send(&select_one_result()).await;
+
+    let (boundary, pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    assert!(pending.is_empty());
+    assert!(matches!(
+        client.read_message().await,
+        Message::RowDescription(_)
+    ));
+    assert!(matches!(client.read_message().await, Message::DataRow(_)));
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+}
+
+#[tokio::test]
+async fn an_open_transaction_holds_the_assignment_until_it_ends() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("BEGIN")).await;
+    expect_query(&mut backend, "BEGIN").await;
+    backend.send(&command_complete("BEGIN", b'T')).await;
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'T').await;
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "an open transaction must hold the assignment"
+    );
+
+    client.send(&query_frame("COMMIT")).await;
+    expect_query(&mut backend, "COMMIT").await;
+    backend.send(&command_complete("COMMIT", b'I')).await;
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+}
+
+#[tokio::test]
+async fn a_failed_transaction_holds_the_assignment_until_it_is_rolled_back() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("SELECT * FROM missing")).await;
+    expect_query(&mut backend, "SELECT * FROM missing").await;
+    backend
+        .send(
+            &[
+                error_response("42P01", "relation \"missing\" does not exist"),
+                frame(b'Z', b"E"),
+            ]
+            .concat(),
+        )
+        .await;
+    assert!(matches!(
+        client.read_message().await,
+        Message::ErrorResponse(_)
+    ));
+    expect_ready(&mut client, b'E').await;
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "a failed transaction must hold the assignment"
+    );
+
+    client.send(&query_frame("ROLLBACK")).await;
+    expect_query(&mut backend, "ROLLBACK").await;
+    backend.send(&command_complete("ROLLBACK", b'I')).await;
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+}
+
+#[tokio::test]
+async fn pipelined_queries_hold_the_assignment_until_the_last_one_is_answered() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(&[query_frame("SELECT 1"), query_frame("SELECT 2")].concat())
+        .await;
+    expect_query(&mut backend, "SELECT 1").await;
+    expect_query(&mut backend, "SELECT 2").await;
+    backend.send(&command_complete("SELECT 1", b'I')).await;
+    backend.send(&command_complete("SELECT 2", b'I')).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    for _ in 0..2 {
+        expect_complete(&mut client).await;
+        expect_ready(&mut client, b'I').await;
+    }
+}
+
+#[tokio::test]
+async fn a_released_assignment_leaves_the_server_connection_to_the_next_client() {
+    let (mut first, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    first.send(&query_frame("SELECT 1")).await;
+    expect_query(&mut backend, "SELECT 1").await;
+    backend.send(&command_complete("SELECT 1", b'I')).await;
+    let (boundary, _pending, server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+
+    let (mut second, proxy) = client_link();
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+    second.send(&query_frame("SELECT 2")).await;
+    expect_query(&mut backend, "SELECT 2").await;
+    backend.send(&command_complete("SELECT 2", b'I')).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    expect_complete(&mut second).await;
+    expect_ready(&mut second, b'I').await;
+}
+
+#[tokio::test]
+async fn terminate_ends_the_assignment_without_reaching_the_server() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&terminate_frame()).await;
+
+    let (boundary, _pending, server) = assignment.await.unwrap();
+    assert_eq!(
+        boundary.unwrap(),
+        Boundary::ClientClosed { may_release: true }
+    );
+    drop(server);
+    assert!(
+        backend.read_to_end().await.is_empty(),
+        "Terminate must not reach a server connection that goes back to the pool"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_mid_transaction_leaves_the_assignment_unreleasable() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("BEGIN")).await;
+    expect_query(&mut backend, "BEGIN").await;
+    backend.send(&command_complete("BEGIN", b'T')).await;
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'T').await;
+    drop(client);
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(
+        boundary.unwrap(),
+        Boundary::ClientClosed { may_release: false }
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_closes_mid_request_fails_the_assignment() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("SELECT 1")).await;
+    expect_query(&mut backend, "SELECT 1").await;
+    drop(backend);
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert!(matches!(boundary.unwrap_err(), RelayError::ServerClosed));
+}
+
+#[tokio::test]
+async fn an_unknown_client_message_fails_the_assignment_before_it_reaches_the_server() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&frame(b'!', b"")).await;
+
+    let (boundary, _pending, server) = assignment.await.unwrap();
+    assert!(matches!(boundary.unwrap_err(), RelayError::Message(_)));
+    drop(server);
+    assert!(backend.read_to_end().await.is_empty());
 }

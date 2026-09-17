@@ -16,6 +16,16 @@ pub trait OpenServer: Send + Sync + 'static {
     fn open(&self) -> impl Future<Output = Result<Self::Connection, ConnectError>> + Send;
 }
 
+/// Closes a server connection and waits for the server to let go of it.
+///
+/// A slot may only be handed on once the connection that held it is gone from
+/// the instance. Dropping the socket is not enough: the server still counts the
+/// connection until it notices the close, so a replacement opened in that
+/// window puts the instance over its budget.
+pub trait CloseServer: Sized + Send {
+    fn close(self) -> impl Future<Output = ()> + Send;
+}
+
 #[derive(Debug, Clone)]
 pub struct InstanceOpener<N> {
     net: N,
@@ -189,6 +199,19 @@ impl<C> Assigned<C> {
             connection: Some(connection),
             pool: Arc::clone(pool),
         }
+    }
+}
+
+impl<C: CloseServer> Assigned<C> {
+    pub async fn discard(mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.close().await;
+        }
+        let mut state = self.pool.lock();
+        state.in_use -= 1;
+        state.opening += 1;
+        drop(state);
+        drop(Reservation::new(&self.pool));
     }
 }
 

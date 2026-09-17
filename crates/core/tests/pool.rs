@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pgsteward_core::pool::{OpenServer, Pool, PoolError, PoolLimits};
+use pgsteward_core::pool::{CloseServer, OpenServer, Pool, PoolError, PoolLimits};
 use pgsteward_core::rt::{Clock, tokio_rt::TokioRuntime};
 use pgsteward_core::server::ConnectError;
 
@@ -96,6 +96,10 @@ impl OpenServer for Opener {
             live: Arc::clone(&self.live),
         })
     }
+}
+
+impl CloseServer for FakeConnection {
+    async fn close(self) {}
 }
 
 fn pool(opener: Opener, slots: usize) -> Pool<Opener, TokioRuntime> {
@@ -305,5 +309,50 @@ async fn the_slot_of_a_refused_open_goes_to_the_waiting_client() {
 
     assert_eq!(served.id, 0);
     assert_eq!(opener.attempts(), 2);
+    assert_eq!(opener.peak(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_discarded_connection_frees_its_slot_without_going_back_to_the_pool() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+
+    let assigned = pool.acquire().await.unwrap();
+    assigned.discard().await;
+
+    assert_eq!(pool.stats().idle, 0);
+    assert_eq!(pool.stats().in_use, 0);
+    assert_eq!(pool.stats().actual(), 0);
+    assert_eq!(opener.live(), 0);
+
+    let next = pool.acquire().await.unwrap();
+
+    assert_eq!(opener.opened(), 2);
+    assert_eq!(
+        opener.peak(),
+        1,
+        "the discarded connection must be closed before its replacement opens"
+    );
+    drop(next);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_slot_of_a_discarded_connection_goes_to_the_waiting_client() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+
+    let assigned = pool.acquire().await.unwrap();
+    let waiting = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.acquire().await }
+    });
+    TokioRuntime::new().sleep(Duration::from_millis(10)).await;
+    assert_eq!(pool.stats().waiting, 1);
+
+    assigned.discard().await;
+    let served = waiting.await.unwrap().unwrap();
+
+    assert_eq!(served.id, 1);
+    assert_eq!(opener.opened(), 2);
     assert_eq!(opener.peak(), 1);
 }

@@ -5,6 +5,7 @@ use std::io;
 
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
+use pgsteward_protocol::framing::{Frame, MAX_MESSAGE, decode_frame};
 use pgsteward_protocol::startup::{
     CancelKey, ProtocolVersion, StartupMessage, StartupRequest, encode_startup,
 };
@@ -16,6 +17,7 @@ use postgres_protocol::message::backend::{
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::pool::CloseServer;
 use crate::rt::Net;
 
 const READ_CHUNK: usize = 8 * 1024;
@@ -207,6 +209,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
         (self.stream, self.read_buf)
     }
 
+    pub async fn read_frame(&mut self) -> io::Result<Option<Frame>> {
+        loop {
+            if let Some(frame) = decode_frame(&mut self.read_buf, MAX_MESSAGE)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            {
+                return Ok(Some(frame));
+            }
+            self.read_buf.reserve(READ_CHUNK);
+            if self.stream.read_buf(&mut self.read_buf).await? == 0 {
+                return Ok(None);
+            }
+        }
+    }
+
+    pub async fn forward(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.stream.write_all(bytes).await?;
+        self.stream.flush().await
+    }
+
+    async fn close_and_drain(mut self) {
+        let _ = send(&mut self.stream, |buf| {
+            frontend::terminate(buf);
+            Ok(())
+        })
+        .await;
+        let _ = self.stream.shutdown().await;
+        let mut sink = [0u8; READ_CHUNK];
+        while matches!(self.stream.read(&mut sink).await, Ok(read) if read > 0) {}
+    }
+
     pub async fn terminate(mut self) -> io::Result<()> {
         send(&mut self.stream, |buf| {
             frontend::terminate(buf);
@@ -214,6 +246,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
         })
         .await?;
         self.stream.shutdown().await
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> CloseServer for ServerConnection<S> {
+    async fn close(self) {
+        self.close_and_drain().await;
     }
 }
 

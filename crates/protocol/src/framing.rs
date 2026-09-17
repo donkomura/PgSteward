@@ -1,5 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+pub const MAX_MESSAGE: usize = 1 << 30;
+
 const HEADER_LEN: usize = 5;
 const LENGTH_FIELD_LEN: usize = 4;
 const STARTUP_CODE_LEN: usize = 4;
