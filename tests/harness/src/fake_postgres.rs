@@ -123,11 +123,15 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, backend: i32) -
     };
     write(&mut stream, &greeting(backend)).await?;
 
+    let mut status = TransactionStatus::Idle;
     while let Some(frame) = read_frame(&mut stream, &mut buf).await? {
         let mut out = BytesMut::new();
         match frame.tag {
             b'X' => return Ok(()),
-            b'Q' => encode_backend_row(backend, &mut out),
+            b'Q' => {
+                status = next_status(status, &frame.body);
+                encode_backend_row(backend, &mut out);
+            }
             _ => encode_error_response(
                 &ErrorResponse::error(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -136,10 +140,24 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, backend: i32) -
                 &mut out,
             ),
         }
-        encode_ready_for_query(TransactionStatus::Idle, &mut out);
+        encode_ready_for_query(status, &mut out);
         write(&mut stream, &out).await?;
     }
     Ok(())
+}
+
+fn next_status(current: TransactionStatus, query: &[u8]) -> TransactionStatus {
+    let text = String::from_utf8_lossy(query);
+    let first_word = text
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '\0')
+        .find(|word| !word.is_empty())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    match first_word.as_str() {
+        "BEGIN" | "START" => TransactionStatus::InTransaction,
+        "COMMIT" | "END" | "ROLLBACK" | "ABORT" => TransactionStatus::Idle,
+        _ => current,
+    }
 }
 
 fn greeting(backend: i32) -> BytesMut {
