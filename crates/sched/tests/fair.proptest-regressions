@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 72e6c5aff84c17371656ff9e853278b5176308192077cca5b878a77246a828ed # shrinks to budget = 0, claims = [Claim { key: 0, min: 1, max: 1, weight: 1, demand: 1 }]
+cc ee2e2993163a6ec46ef3e4b7befe8d674c496099feaa0ac3fbed70c7151028d1 # shrinks to budget = 0, claims = [Claim { key: 0, min: 1, max: 1, weight: 1, demand: 1 }]
+cc 1c8c8ae5673e8ad6b70940e24fd9e85e04df5e371f270bb63e0ffd54840e7dea # shrinks to budget = 0, claims = [Claim { key: 0, min: 1, max: 1, weight: 1, demand: 1 }]
+cc e3625f90dac990cfaa90b7b7c8812ce64319126f3c5f28ef5801d629f524c92e # shrinks to budget = 0, extra = 0, claims = [Claim { key: 0, min: 1, max: 1, weight: 1, demand: 1 }]
+cc 1594865f19a62a79242a5bf29251d9a74e7a3a83020aba992900153a577046c7 # shrinks to budget = 0, claims = [Claim { key: 0, min: 1, max: 1, weight: 1, demand: 1 }], seed = 0
+cc cbd0fbb430fa76a51e18007c1987b8e149ed50f4c4ccc3cbeb03d59840c0a2ef # shrinks to budget = 0, claims = [Claim { key: 0, min: 1, max: 1, weight: 1, demand: 0 }], extra = 1, pick = Index(0)
