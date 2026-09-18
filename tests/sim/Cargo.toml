@@ -16,6 +16,7 @@ path = "src/lib.rs"
 pgsteward-core = { workspace = true, features = ["turmoil"] }
 pgsteward-harness.workspace = true
 pgsteward-protocol.workspace = true
+pgsteward-sched.workspace = true
 bytes.workspace = true
 fallible-iterator.workspace = true
 postgres-protocol.workspace = true

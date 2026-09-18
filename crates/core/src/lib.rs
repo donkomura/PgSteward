@@ -2,6 +2,7 @@ pub mod admission;
 pub mod allocation;
 pub mod auth;
 pub mod budget;
+pub mod convergence;
 pub mod grant;
 pub mod inspect;
 pub mod pool;

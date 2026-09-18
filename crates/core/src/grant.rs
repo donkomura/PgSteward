@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use pgsteward_sched::{Allocator, Claim};
 use tokio::sync::watch;
@@ -8,6 +9,7 @@ use tokio::sync::watch;
 use crate::allocation::{
     AllocationTable, Desired, Entry, Holder, InstanceId, PreconditionError, ProxyId,
 };
+use crate::rt::Clock;
 use crate::tenant::TenantId;
 
 type Slot = (InstanceId, TenantId);
@@ -187,6 +189,15 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
             grants: next,
         });
         Ok(())
+    }
+
+    pub async fn run<K: Clock>(&self, clock: &K, interval: Duration) {
+        loop {
+            if let Err(error) = self.reconcile() {
+                tracing::error!(%error, "the desired state was rejected by the allocation table");
+            }
+            clock.sleep(interval).await;
+        }
     }
 
     fn desired_state(&self, state: &State) -> Entry {
