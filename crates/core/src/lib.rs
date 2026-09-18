@@ -5,6 +5,7 @@ pub mod budget;
 pub mod convergence;
 pub mod grant;
 pub mod inspect;
+pub mod policy;
 pub mod pool;
 pub mod relay;
 pub mod rt;

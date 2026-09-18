@@ -22,6 +22,7 @@ pgsteward-protocol = { path = "crates/protocol", version = "0.1.0" }
 pgsteward-sched = { path = "crates/sched", version = "0.1.0" }
 pgsteward-core = { path = "crates/core", version = "0.1.0" }
 pgsteward-harness = { path = "tests/harness", version = "0.1.0" }
+pgsteward-node = { path = "crates/node", version = "0.1.0" }
 
 anyhow = "1.0"
 base64 = "0.23"

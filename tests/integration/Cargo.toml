@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 pgsteward-core.workspace = true
 pgsteward-harness = { workspace = true, features = ["postgres"] }
+pgsteward-node.workspace = true
 anyhow.workspace = true
 testcontainers.workspace = true
 testcontainers-modules.workspace = true

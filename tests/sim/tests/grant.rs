@@ -5,6 +5,7 @@ use std::time::Duration;
 use pgsteward_core::allocation::{InstanceId, ProxyId};
 use pgsteward_core::convergence::ProxyPools;
 use pgsteward_core::grant::{InProcessCoordinator, TenantPolicy};
+use pgsteward_core::policy::{Policies, TenantRule};
 use pgsteward_core::pool::{InstanceOpener, Pool, PoolLimits};
 use pgsteward_core::rt::{Clock, Spawner, turmoil_rt::TurmoilRuntime};
 use pgsteward_core::server::{ApplicationName, ServerCredentials, SimpleQuery};
@@ -85,19 +86,22 @@ fn compete(seed: u64) {
             WeightedMaxMinFair::default(),
         ));
         coordinator.set_budget(primary(), BUDGET);
+        coordinator.set_policies(
+            Policies::new()
+                .instance(primary(), NonZeroU32::new(1).unwrap())
+                .tenant(
+                    "*",
+                    TenantRule {
+                        instances: vec![primary()],
+                        policy: TenantPolicy {
+                            min: 0,
+                            max: u32::MAX,
+                            weight: NonZeroU32::new(1).unwrap(),
+                        },
+                    },
+                ),
+        );
         let pools = Arc::new(ProxyPools::new());
-        for user in TENANTS {
-            coordinator.set_policy(
-                primary(),
-                tenant(user),
-                TenantPolicy {
-                    min: 0,
-                    max: u32::MAX,
-                    weight: NonZeroU32::new(1).unwrap(),
-                },
-            );
-            pools.insert(primary(), tenant(user), pool(rt));
-        }
         let coordinating = rt.spawn({
             let coordinator = Arc::clone(&coordinator);
             async move { coordinator.run(&rt, INTERVAL).await }
@@ -111,10 +115,11 @@ fn compete(seed: u64) {
         let clients: Vec<_> = TENANTS
             .iter()
             .flat_map(|user| {
-                let pool = pools.get(&primary(), &tenant(user)).unwrap();
+                let pools = Arc::clone(&pools);
                 (0..CLIENTS_PER_TENANT).map(move |_| {
-                    let pool = pool.clone();
+                    let pools = Arc::clone(&pools);
                     rt.spawn(async move {
+                        let (pool, _) = pools.checkout(&primary(), &tenant(user), || pool(rt));
                         let mut assigned = pool.acquire().await.unwrap();
                         assigned
                             .simple_query("SELECT pg_backend_pid()")
@@ -128,6 +133,12 @@ fn compete(seed: u64) {
         for client in clients {
             client.await.unwrap();
         }
+        rt.sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            pools.len(),
+            0,
+            "a tenant whose clients are gone keeps no pool"
+        );
 
         coordinating.abort();
         converging.abort();

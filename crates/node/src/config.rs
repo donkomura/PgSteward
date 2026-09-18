@@ -1,11 +1,18 @@
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use pgsteward_core::admission::ClientLimit;
+use pgsteward_core::allocation::InstanceId;
 use pgsteward_core::auth::{AuthMethod, ClientCredentials};
+use pgsteward_core::grant::TenantPolicy;
+use pgsteward_core::policy::{Policies, TenantRule};
 use pgsteward_core::scram::ScramVerifier;
+use pgsteward_core::server::ServerCredentials;
+use pgsteward_core::tenant::TenantId;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +45,38 @@ pub struct NodeConfig {
     pub node: NodeSection,
     #[serde(default)]
     pub client: BTreeMap<String, ClientSection>,
+    #[serde(default)]
+    pub server: BTreeMap<String, ServerSection>,
+    pub monitor: Option<MonitorSection>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSection {
+    pub password: String,
+}
+
+impl fmt::Debug for ServerSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerSection")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The login this node uses to read `max_connections` and to count the foreign
+/// connections of each instance. Counting other users' backends needs the
+/// `pg_monitor` role or a superuser.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorSection {
+    pub user: String,
+    #[serde(default = "default_monitor_database")]
+    pub database: String,
+}
+
+fn default_monitor_database() -> String {
+    "postgres".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +123,32 @@ impl NodeConfig {
         Ok(credentials)
     }
 
+    /// A server connection for a tenant logs in as the tenant's user to the
+    /// tenant's database, with the password of that user's `[server."…"]`
+    /// section, or none when the user has no section.
+    #[must_use]
+    pub fn server_credentials(&self, tenant: &TenantId) -> ServerCredentials {
+        ServerCredentials {
+            user: tenant.user().to_owned(),
+            database: tenant.database().to_owned(),
+            password: self.password(tenant.user()),
+        }
+    }
+
+    #[must_use]
+    pub fn monitor_credentials(&self) -> Option<ServerCredentials> {
+        let monitor = self.monitor.as_ref()?;
+        Some(ServerCredentials {
+            user: monitor.user.clone(),
+            database: monitor.database.clone(),
+            password: self.password(&monitor.user),
+        })
+    }
+
+    fn password(&self, user: &str) -> Option<String> {
+        self.server.get(user).map(|server| server.password.clone())
+    }
+
     /// How many client connections this node accepts at once.
     #[must_use]
     pub fn client_limit(&self) -> ClientLimit {
@@ -110,6 +175,17 @@ impl NodeConfig {
             ));
         }
         self.client_credentials()?;
+        if self.server.keys().any(|user| user.trim().is_empty()) {
+            return Err(ConfigError::invalid(
+                "server",
+                "a server section must name the user it holds a password for",
+            ));
+        }
+        if let Some(monitor) = &self.monitor
+            && monitor.user.trim().is_empty()
+        {
+            return Err(ConfigError::invalid("monitor.user", "must not be empty"));
+        }
         Ok(())
     }
 }
@@ -164,11 +240,63 @@ fn default_weight() -> u32 {
     1
 }
 
+const DEFAULT_PORT: u16 = 5432;
+
+impl InstanceSection {
+    #[must_use]
+    pub fn id(&self) -> InstanceId {
+        InstanceId::new(&self.name)
+    }
+
+    /// The name is resolved as the address to connect to, on port 5432 unless
+    /// it names another one.
+    #[must_use]
+    pub fn address(&self) -> String {
+        if self
+            .name
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
+        {
+            self.name.clone()
+        } else {
+            format!("{}:{DEFAULT_PORT}", self.name)
+        }
+    }
+}
+
 impl ClusterConfig {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// The tenant rules as the coordinator applies them. A tenant without `max`
+    /// may take up to the whole total budget of an instance, which the
+    /// allocator enforces on its own.
+    #[must_use]
+    pub fn policies(&self) -> Policies {
+        let policies = self
+            .instance
+            .iter()
+            .fold(Policies::new(), |policies, instance| {
+                policies.instance(instance.id(), nonzero(instance.weight))
+            });
+        self.tenant
+            .iter()
+            .fold(policies, |policies, (key, tenant)| {
+                policies.tenant(
+                    key.clone(),
+                    TenantRule {
+                        instances: tenant.instances.iter().map(InstanceId::new).collect(),
+                        policy: TenantPolicy {
+                            min: tenant.min,
+                            max: tenant.max.unwrap_or(u32::MAX),
+                            weight: nonzero(tenant.weight),
+                        },
+                    },
+                )
+            })
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -286,4 +414,8 @@ fn validate_tenant(
         ));
     }
     Ok(())
+}
+
+fn nonzero(weight: u32) -> NonZeroU32 {
+    NonZeroU32::new(weight).expect("weights are validated to be at least 1")
 }
