@@ -1577,6 +1577,7 @@ dependencies = [
  "anyhow",
  "pgsteward-core",
  "pgsteward-harness",
+ "pgsteward-node",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
@@ -1588,9 +1589,13 @@ name = "pgsteward-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "humantime-serde",
  "pgsteward-core",
+ "pgsteward-protocol",
+ "pgsteward-sched",
+ "rand 0.10.2",
  "serde",
  "thiserror",
  "tokio",

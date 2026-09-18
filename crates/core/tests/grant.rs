@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 
 use pgsteward_core::allocation::{Holder, InstanceId, ProxyId};
 use pgsteward_core::grant::{GrantChannel, InProcessCoordinator, Report, TenantPolicy, Usage};
+use pgsteward_core::policy::{Policies, TenantRule};
 use pgsteward_core::tenant::TenantId;
 use pgsteward_sched::fair::WeightedMaxMinFair;
 use proptest::prelude::*;
@@ -30,10 +31,23 @@ fn open_policy() -> TenantPolicy {
 fn coordinator(budget: u32, tenants: &[&str]) -> InProcessCoordinator<WeightedMaxMinFair> {
     let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
     coordinator.set_budget(primary(), budget);
-    for user in tenants {
-        coordinator.set_policy(primary(), tenant(user), open_policy());
-    }
+    coordinator.set_policies(policies(tenants, open_policy()));
     coordinator
+}
+
+fn policies(tenants: &[&str], policy: TenantPolicy) -> Policies {
+    tenants.iter().fold(
+        Policies::new().instance(primary(), NonZeroU32::new(1).unwrap()),
+        |policies, user| {
+            policies.tenant(
+                *user,
+                TenantRule {
+                    instances: vec![primary()],
+                    policy,
+                },
+            )
+        },
+    )
 }
 
 fn granted(coordinator: &InProcessCoordinator<WeightedMaxMinFair>, user: &str) -> u32 {
@@ -90,14 +104,13 @@ fn nothing_is_granted_before_a_reconciliation() {
 fn a_tenant_without_demand_is_granted_nothing_despite_its_minimum() {
     let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
     coordinator.set_budget(primary(), 10);
-    coordinator.set_policy(
-        primary(),
-        tenant("alice"),
+    coordinator.set_policies(policies(
+        &["alice"],
         TenantPolicy {
             min: 5,
             ..open_policy()
         },
-    );
+    ));
     report(&coordinator, &[("alice", 0, 0)]);
 
     coordinator.reconcile().unwrap();
@@ -119,7 +132,7 @@ fn a_tenant_without_a_policy_is_granted_nothing() {
 #[test]
 fn an_instance_without_a_budget_grants_nothing() {
     let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
-    coordinator.set_policy(primary(), tenant("alice"), open_policy());
+    coordinator.set_policies(policies(&["alice"], open_policy()));
     report(&coordinator, &[("alice", 3, 0)]);
 
     coordinator.reconcile().unwrap();
@@ -393,4 +406,43 @@ proptest! {
             prop_assert!(coordinator.table().granted_total(&primary()) <= budget);
         }
     }
+}
+
+#[test]
+fn a_tenant_covered_by_the_wildcard_is_granted() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+    coordinator.set_budget(primary(), 10);
+    coordinator.set_policies(policies(&["*"], open_policy()));
+    report(&coordinator, &[("alice", 3, 0)]);
+
+    coordinator.reconcile().unwrap();
+
+    assert_eq!(granted(&coordinator, "alice"), 3);
+}
+
+#[test]
+fn a_tenant_is_granted_nothing_on_an_instance_its_rule_does_not_list() {
+    let replica = InstanceId::new("replica");
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+    coordinator.set_budget(primary(), 10);
+    coordinator.set_budget(replica.clone(), 10);
+    coordinator.set_policies(policies(&["alice"], open_policy()));
+    coordinator.report(Report::new(0).usage(
+        replica.clone(),
+        tenant("alice"),
+        Usage {
+            demand: 3,
+            actual: 0,
+        },
+    ));
+
+    coordinator.reconcile().unwrap();
+
+    assert_eq!(
+        coordinator
+            .grants()
+            .borrow()
+            .get(&replica, &tenant("alice")),
+        0
+    );
 }

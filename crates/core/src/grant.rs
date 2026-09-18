@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use crate::allocation::{
     AllocationTable, Desired, Entry, Holder, InstanceId, PreconditionError, ProxyId,
 };
+use crate::policy::Policies;
 use crate::rt::Clock;
 use crate::tenant::TenantId;
 
@@ -119,7 +120,7 @@ pub struct InProcessCoordinator<A> {
 struct State {
     table: AllocationTable,
     budgets: BTreeMap<InstanceId, u32>,
-    policies: BTreeMap<Slot, TenantPolicy>,
+    policies: Policies,
     demand: BTreeMap<Slot, u32>,
     held: BTreeMap<Slot, Held>,
     generation: u64,
@@ -152,8 +153,8 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         self.lock().budgets.insert(instance, budget);
     }
 
-    pub fn set_policy(&self, instance: InstanceId, tenant: TenantId, policy: TenantPolicy) {
-        self.lock().policies.insert((instance, tenant), policy);
+    pub fn set_policies(&self, policies: Policies) {
+        self.lock().policies = policies;
     }
 
     #[must_use]
@@ -203,15 +204,15 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
     fn desired_state(&self, state: &State) -> Entry {
         let mut entry = Entry::new();
         for (instance, &budget) in &state.budgets {
-            let claims = self.claims(state, instance);
-            let targets = self.allocator.allocate(budget, &claims);
             let tenants: BTreeSet<&TenantId> = state
-                .policies
+                .demand
                 .keys()
                 .chain(state.held.keys())
                 .filter(|(of, _)| of == instance)
                 .map(|(_, tenant)| tenant)
                 .collect();
+            let claims = self.claims(state, instance, &tenants);
+            let targets = self.allocator.allocate(budget, &claims);
             let occupied: u32 = tenants
                 .iter()
                 .map(|tenant| state.occupied(instance, tenant))
@@ -237,21 +238,29 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         entry
     }
 
-    fn claims(&self, state: &State, instance: &InstanceId) -> Vec<Claim<Holder>> {
-        state
-            .policies
+    fn claims(
+        &self,
+        state: &State,
+        instance: &InstanceId,
+        tenants: &BTreeSet<&TenantId>,
+    ) -> Vec<Claim<Holder>> {
+        tenants
             .iter()
-            .filter(|((of, _), _)| of == instance)
-            .map(|(slot, policy)| {
-                let holder = self.holder(&slot.1);
-                Claim {
+            .filter_map(|tenant| {
+                let policy = state.policies.policy(instance, tenant)?;
+                let holder = self.holder(tenant);
+                Some(Claim {
                     min: policy.min,
                     max: policy.max,
                     weight: policy.weight,
-                    demand: state.demand.get(slot).copied().unwrap_or(0),
+                    demand: state
+                        .demand
+                        .get(&(instance.clone(), (*tenant).clone()))
+                        .copied()
+                        .unwrap_or(0),
                     current: state.table.granted(instance, &holder),
                     key: holder,
-                }
+                })
             })
             .collect()
     }

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use pgsteward_core::allocation::InstanceId;
 use pgsteward_core::auth::{AuthMethod, Credentials};
 use pgsteward_core::tenant::TenantId;
 use pgsteward_node::config::{ClusterConfig, ConfigError, NodeConfig, PoolMode, Role};
@@ -287,4 +288,156 @@ fn the_client_connection_limit_comes_from_the_node_local_config() {
     let limit = config.client_limit();
     assert_eq!(limit.max(), 5000);
     assert_eq!(limit.live(), 0);
+}
+
+#[test]
+fn a_server_connection_logs_in_as_the_tenant_user_to_the_tenant_database() {
+    let text = with_clients("[server.\"app_web\"]\npassword = \"s3cret\"\n");
+    let config = NodeConfig::parse(&text).unwrap();
+
+    let credentials = config.server_credentials(&TenantId::new("app_web", "reports"));
+
+    assert_eq!(credentials.user, "app_web");
+    assert_eq!(credentials.database, "reports");
+    assert_eq!(credentials.password.as_deref(), Some("s3cret"));
+}
+
+#[test]
+fn a_user_without_a_server_section_logs_in_without_a_password() {
+    let config = NodeConfig::parse(NODE_LOCAL).unwrap();
+
+    let credentials = config.server_credentials(&TenantId::new("app_web", "app_web"));
+
+    assert_eq!(credentials.user, "app_web");
+    assert_eq!(credentials.password, None);
+}
+
+#[test]
+fn a_server_password_never_appears_in_the_debug_output() {
+    let text = with_clients("[server.\"app_web\"]\npassword = \"s3cret\"\n");
+    let config = NodeConfig::parse(&text).unwrap();
+
+    assert!(!format!("{config:?}").contains("s3cret"));
+}
+
+#[test]
+fn a_server_section_takes_nothing_but_a_password() {
+    let text = with_clients("[server.\"app_web\"]\npassword = \"s3cret\"\nuser = \"other\"\n");
+
+    let err = NodeConfig::parse(&text).unwrap_err();
+
+    assert!(err.to_string().contains("user"), "{err}");
+    assert!(!err.to_string().contains("s3cret"), "{err}");
+}
+
+#[test]
+fn the_monitor_logs_in_with_its_own_user_and_the_password_of_its_server_section() {
+    let text = with_clients(
+        "[monitor]\nuser = \"pgsteward_monitor\"\n\n[server.\"pgsteward_monitor\"]\npassword = \"watch\"\n",
+    );
+    let config = NodeConfig::parse(&text).unwrap();
+
+    let credentials = config.monitor_credentials().unwrap();
+
+    assert_eq!(credentials.user, "pgsteward_monitor");
+    assert_eq!(credentials.database, "postgres");
+    assert_eq!(credentials.password.as_deref(), Some("watch"));
+}
+
+#[test]
+fn the_monitor_database_can_be_named() {
+    let text = with_clients("[monitor]\nuser = \"watcher\"\ndatabase = \"ops\"\n");
+    let config = NodeConfig::parse(&text).unwrap();
+
+    assert_eq!(config.monitor_credentials().unwrap().database, "ops");
+}
+
+#[test]
+fn a_node_without_a_monitor_section_has_no_monitor() {
+    let config = NodeConfig::parse(NODE_LOCAL).unwrap();
+
+    assert!(config.monitor_credentials().is_none());
+}
+
+#[test]
+fn the_cluster_config_resolves_tenants_through_its_rules() {
+    let config = ClusterConfig::parse(CLUSTER).unwrap();
+
+    let policies = config.policies();
+
+    let web = policies.resolve(&TenantId::new("app_web", "shop")).unwrap();
+    assert_eq!(web.policy.min, 30);
+    assert_eq!(web.policy.max, u32::MAX);
+    assert_eq!(web.instances, vec![InstanceId::new("db-primary.internal")]);
+    let unnamed = policies.resolve(&TenantId::new("batch", "batch")).unwrap();
+    assert_eq!(unnamed.policy.max, 20);
+}
+
+#[test]
+fn a_rule_can_name_a_user_and_a_database() {
+    let text = format!(
+        "{CLUSTER}\n[tenant.\"app_web@reports\"]\ninstances = [\"db-replica-1.internal\"]\nmin = 2\n"
+    );
+    let config = ClusterConfig::parse(&text).unwrap();
+
+    let policies = config.policies();
+
+    let reports = policies
+        .resolve(&TenantId::new("app_web", "reports"))
+        .unwrap();
+    assert_eq!(reports.policy.min, 2);
+    assert_eq!(
+        policies
+            .resolve(&TenantId::new("app_web", "shop"))
+            .unwrap()
+            .policy
+            .min,
+        30
+    );
+}
+
+#[test]
+fn the_cluster_config_routes_by_instance_weight() {
+    let text = CLUSTER.replace(
+        "instances = [\"db-replica-1.internal\"]\nmin       = 0",
+        "instances = [\"db-primary.internal\", \"db-replica-1.internal\"]\nmin       = 0",
+    );
+    let config = ClusterConfig::parse(&text).unwrap();
+    let policies = config.policies();
+    let report = TenantId::new("app_report", "app_report");
+
+    assert_eq!(
+        policies.route(&report, |total| {
+            assert_eq!(total, 3);
+            0
+        }),
+        Some(&InstanceId::new("db-primary.internal"))
+    );
+    assert_eq!(
+        policies.route(&report, |_| 1),
+        Some(&InstanceId::new("db-replica-1.internal"))
+    );
+}
+
+#[test]
+fn an_instance_name_without_a_port_is_reached_on_5432() {
+    let config = ClusterConfig::parse(CLUSTER).unwrap();
+
+    assert_eq!(config.instance[0].address(), "db-primary.internal:5432");
+}
+
+#[test]
+fn an_instance_name_with_a_port_is_reached_on_that_port() {
+    let text = CLUSTER
+        .replace(
+            "name   = \"db-primary.internal\"",
+            "name   = \"db-primary.internal:5433\"",
+        )
+        .replace(
+            "instances = [\"db-primary.internal\"]",
+            "instances = [\"db-primary.internal:5433\"]",
+        );
+    let config = ClusterConfig::parse(&text).unwrap();
+
+    assert_eq!(config.instance[0].address(), "db-primary.internal:5433");
 }

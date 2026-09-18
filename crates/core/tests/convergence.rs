@@ -6,6 +6,7 @@ use std::time::Duration;
 use pgsteward_core::allocation::{InstanceId, ProxyId};
 use pgsteward_core::convergence::ProxyPools;
 use pgsteward_core::grant::{GrantChannel, GrantSet, InProcessCoordinator, TenantPolicy};
+use pgsteward_core::policy::{Policies, TenantRule};
 use pgsteward_core::pool::{CloseServer, OpenServer, Pool, PoolLimits, PoolStats};
 use pgsteward_core::rt::{Clock, tokio_rt::TokioRuntime};
 use pgsteward_core::server::ConnectError;
@@ -92,17 +93,22 @@ fn coordinator(budget: u32, tenants: &[&str]) -> Arc<InProcessCoordinator<Weight
     let coordinator =
         InProcessCoordinator::new(ProxyId::new("proxy-1"), WeightedMaxMinFair::default());
     coordinator.set_budget(primary(), budget);
-    for user in tenants {
-        coordinator.set_policy(
-            primary(),
-            tenant(user),
-            TenantPolicy {
-                min: 0,
-                max: u32::MAX,
-                weight: NonZeroU32::new(1).unwrap(),
-            },
-        );
-    }
+    coordinator.set_policies(tenants.iter().fold(
+        Policies::new().instance(primary(), NonZeroU32::new(1).unwrap()),
+        |policies, user| {
+            policies.tenant(
+                *user,
+                TenantRule {
+                    instances: vec![primary()],
+                    policy: TenantPolicy {
+                        min: 0,
+                        max: u32::MAX,
+                        weight: NonZeroU32::new(1).unwrap(),
+                    },
+                },
+            )
+        },
+    ));
     Arc::new(coordinator)
 }
 
@@ -222,7 +228,6 @@ async fn a_connection_still_opening_is_reported_as_actual() {
 async fn the_control_loop_serves_a_client_without_a_fixed_pool_size() {
     let opener = Opener::default();
     let pools = Arc::new(ProxyPools::new());
-    pools.insert(primary(), tenant("alice"), pool(opener.clone()));
     let coordinator = coordinator(2, &["alice"]);
     let clock = TokioRuntime::new();
     let coordinating = tokio::spawn({
@@ -235,7 +240,7 @@ async fn the_control_loop_serves_a_client_without_a_fixed_pool_size() {
         async move { pools.run(coordinator.as_ref(), &clock, INTERVAL).await }
     });
 
-    let pool = pools.get(&primary(), &tenant("alice")).unwrap();
+    let (pool, _) = pools.checkout(&primary(), &tenant("alice"), || pool(opener.clone()));
     let served = pool.acquire().await.unwrap();
 
     assert_eq!(opener.live(), 1);
@@ -248,8 +253,6 @@ async fn the_control_loop_serves_a_client_without_a_fixed_pool_size() {
 async fn a_slot_moves_between_tenants_without_exceeding_the_budget() {
     let opener = Opener::default();
     let pools = Arc::new(ProxyPools::new());
-    pools.insert(primary(), tenant("alice"), pool(opener.clone()));
-    pools.insert(primary(), tenant("bob"), pool(opener.clone()));
     let coordinator = coordinator(1, &["alice", "bob"]);
     let clock = TokioRuntime::new();
     let coordinating = tokio::spawn({
@@ -262,8 +265,8 @@ async fn a_slot_moves_between_tenants_without_exceeding_the_budget() {
         async move { pools.run(coordinator.as_ref(), &clock, INTERVAL).await }
     });
 
-    let alice = pools.get(&primary(), &tenant("alice")).unwrap();
-    let bob = pools.get(&primary(), &tenant("bob")).unwrap();
+    let (alice, _) = pools.checkout(&primary(), &tenant("alice"), || pool(opener.clone()));
+    let (bob, _) = pools.checkout(&primary(), &tenant("bob"), || pool(opener.clone()));
     drop(alice.acquire().await.unwrap());
     let served = bob.acquire().await.unwrap();
 
@@ -271,6 +274,113 @@ async fn a_slot_moves_between_tenants_without_exceeding_the_budget() {
     assert_eq!(opener.peak(), 1);
     assert_eq!(alice.stats().occupied(), 0);
     drop(served);
+    coordinating.abort();
+    converging.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_checkout_opens_one_pool_per_instance_and_tenant() {
+    let opener = Opener::default();
+    let pools = ProxyPools::new();
+    let mut made = 0;
+
+    let (first, _) = pools.checkout(&primary(), &tenant("alice"), || {
+        made += 1;
+        pool(opener.clone())
+    });
+    let (second, _) = pools.checkout(&primary(), &tenant("alice"), || {
+        made += 1;
+        pool(opener.clone())
+    });
+    let (other, _) = pools.checkout(&primary(), &tenant("bob"), || {
+        made += 1;
+        pool(opener.clone())
+    });
+
+    assert_eq!(made, 2);
+    first.converge(3).await;
+    assert_eq!(second.stats().slots, 3);
+    assert_eq!(other.stats().slots, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pool_nobody_uses_is_dropped_once_its_grant_is_gone() {
+    let opener = Opener::default();
+    let pools = ProxyPools::new();
+    let (alice, _) = pools.checkout(&primary(), &tenant("alice"), || pool(opener.clone()));
+    alice.converge(1).await;
+    drop(alice.acquire().await.unwrap());
+    drop(alice);
+
+    pools.converge(&GrantSet::default()).await;
+
+    assert!(pools.get(&primary(), &tenant("alice")).is_none());
+    assert_eq!(pools.len(), 0);
+    assert_eq!(opener.live(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pool_a_client_still_holds_is_kept_without_a_grant() {
+    let opener = Opener::default();
+    let pools = ProxyPools::new();
+    let (alice, _) = pools.checkout(&primary(), &tenant("alice"), || pool(opener.clone()));
+
+    pools.converge(&GrantSet::default()).await;
+
+    assert!(pools.get(&primary(), &tenant("alice")).is_some());
+    drop(alice);
+    pools.converge(&GrantSet::default()).await;
+    assert!(pools.get(&primary(), &tenant("alice")).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pool_that_still_has_a_grant_is_kept_while_idle() {
+    let opener = Opener::default();
+    let pools = Arc::new(ProxyPools::new());
+    let coordinator = coordinator(2, &["alice"]);
+    let (alice, _) = pools.checkout(&primary(), &tenant("alice"), || pool(opener.clone()));
+    let waiting = tokio::spawn({
+        let alice = alice.clone();
+        async move { alice.acquire().await }
+    });
+    settle().await;
+    coordinator.report(pools.report(0));
+    coordinator.reconcile().unwrap();
+    let grants = coordinator.grants().borrow().clone();
+    pools.converge(&grants).await;
+    drop(waiting.await.unwrap().unwrap());
+    drop(alice);
+
+    pools.converge(&grants).await;
+
+    assert!(pools.get(&primary(), &tenant("alice")).is_some());
+    assert_eq!(opener.live(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tenant_without_a_minimum_keeps_no_pool_once_its_clients_are_gone() {
+    let opener = Opener::default();
+    let pools = Arc::new(ProxyPools::new());
+    let coordinator = coordinator(2, &["alice"]);
+    let clock = TokioRuntime::new();
+    let coordinating = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move { coordinator.run(&clock, INTERVAL).await }
+    });
+    let converging = tokio::spawn({
+        let pools = Arc::clone(&pools);
+        let coordinator = Arc::clone(&coordinator);
+        async move { pools.run(coordinator.as_ref(), &clock, INTERVAL).await }
+    });
+    let (alice, _) = pools.checkout(&primary(), &tenant("alice"), || pool(opener.clone()));
+    drop(alice.acquire().await.unwrap());
+    drop(alice);
+
+    clock.sleep(INTERVAL * 20).await;
+
+    assert_eq!(pools.len(), 0);
+    assert_eq!(opener.live(), 0);
+    assert_eq!(coordinator.table().holders(&primary()).count(), 0);
     coordinating.abort();
     converging.abort();
 }

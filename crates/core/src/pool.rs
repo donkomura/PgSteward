@@ -141,6 +141,14 @@ impl<O: OpenServer, K: Clock> Pool<O, K> {
         self.inner.stats()
     }
 
+    /// True when nothing but this handle refers to the pool and it holds no
+    /// connection: no client is waiting on it, none holds an assignment, and
+    /// the instance has nothing of it left to close.
+    #[must_use]
+    pub fn is_unused(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1 && self.stats().occupied() == 0
+    }
+
     pub async fn acquire(&self) -> Result<Assigned<O::Connection>, PoolError> {
         match self.inner.request() {
             Request::Assigned(assigned) => Ok(assigned),
