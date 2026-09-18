@@ -85,6 +85,16 @@ impl PoolStats {
     pub fn actual(&self) -> usize {
         self.idle + self.in_use + self.closing
     }
+
+    #[must_use]
+    pub fn occupied(&self) -> usize {
+        self.actual() + self.opening
+    }
+
+    #[must_use]
+    pub fn demand(&self) -> usize {
+        self.waiting + self.in_use + self.opening
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
