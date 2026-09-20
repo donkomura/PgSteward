@@ -179,7 +179,7 @@ fn startup_tail() -> Vec<u8> {
     .concat()
 }
 
-fn select_one_result() -> Vec<u8> {
+fn row_description() -> Vec<u8> {
     let mut description = BytesMut::new();
     description.put_i16(1);
     description.put_slice(b"?column?\0");
@@ -189,13 +189,21 @@ fn select_one_result() -> Vec<u8> {
     description.put_i16(4);
     description.put_i32(-1);
     description.put_i16(0);
+    frame(b'T', &description)
+}
+
+fn data_row() -> Vec<u8> {
     let mut row = BytesMut::new();
     row.put_i16(1);
     row.put_i32(1);
     row.put_slice(b"1");
+    frame(b'D', &row)
+}
+
+fn select_one_result() -> Vec<u8> {
     [
-        frame(b'T', &description),
-        frame(b'D', &row),
+        row_description(),
+        data_row(),
         frame(b'C', b"SELECT 1\0"),
         frame(b'Z', b"I"),
     ]
@@ -654,4 +662,161 @@ async fn an_unknown_client_message_fails_the_assignment_before_it_reaches_the_se
     assert!(matches!(boundary.unwrap_err(), RelayError::Message(_)));
     drop(server);
     assert!(backend.read_to_end().await.is_empty());
+}
+
+fn parse_frame(statement: &str, sql: &str) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_slice(statement.as_bytes());
+    body.put_u8(0);
+    body.put_slice(sql.as_bytes());
+    body.put_u8(0);
+    body.put_i16(0);
+    frame(b'P', &body)
+}
+
+fn bind_frame(portal: &str, statement: &str) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_slice(portal.as_bytes());
+    body.put_u8(0);
+    body.put_slice(statement.as_bytes());
+    body.put_u8(0);
+    body.put_i16(0);
+    body.put_i16(0);
+    body.put_i16(0);
+    frame(b'B', &body)
+}
+
+fn execute_frame(portal: &str) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_slice(portal.as_bytes());
+    body.put_u8(0);
+    body.put_i32(0);
+    frame(b'E', &body)
+}
+
+fn flush_frame() -> Vec<u8> {
+    frame(b'H', &[])
+}
+
+fn sync_frame() -> Vec<u8> {
+    frame(b'S', &[])
+}
+
+fn extended_select_one() -> Vec<u8> {
+    [
+        parse_frame("", "SELECT 1"),
+        bind_frame("", ""),
+        execute_frame(""),
+    ]
+    .concat()
+}
+
+fn extended_select_one_result() -> Vec<u8> {
+    [
+        frame(b'1', &[]),
+        frame(b'2', &[]),
+        row_description(),
+        data_row(),
+        frame(b'C', b"SELECT 1\0"),
+    ]
+    .concat()
+}
+
+async fn expect_backend_frames(backend: &mut Backend, tags: &[u8]) {
+    for &tag in tags {
+        assert_eq!(backend.read_frame().await.tag, tag);
+    }
+}
+
+async fn expect_client_frames(client: &mut Client, tags: &[u8]) {
+    for &tag in tags {
+        assert_eq!(client.read_frame().await.tag, tag);
+    }
+}
+
+#[tokio::test]
+async fn an_answered_flush_holds_the_assignment_until_the_sync_is_answered() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(&[extended_select_one(), flush_frame()].concat())
+        .await;
+    expect_backend_frames(&mut backend, b"PBEH").await;
+    backend.send(&extended_select_one_result()).await;
+    expect_client_frames(&mut client, b"12TDC").await;
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "an extended query window must hold the assignment until its Sync is answered"
+    );
+
+    client.send(&sync_frame()).await;
+    expect_backend_frames(&mut backend, b"S").await;
+    backend.send(&frame(b'Z', b"I")).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    expect_ready(&mut client, b'I').await;
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_before_its_sync_leaves_the_assignment_unreleasable() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(&[extended_select_one(), flush_frame()].concat())
+        .await;
+    expect_backend_frames(&mut backend, b"PBEH").await;
+    backend.send(&extended_select_one_result()).await;
+    expect_client_frames(&mut client, b"12TDC").await;
+    drop(client);
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(
+        boundary.unwrap(),
+        Boundary::ClientClosed { may_release: false }
+    );
+}
+
+#[tokio::test]
+async fn a_parse_pipelined_after_the_sync_holds_the_assignment_past_the_ready_for_query() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(
+            &[
+                extended_select_one(),
+                sync_frame(),
+                parse_frame("", "SELECT 2"),
+            ]
+            .concat(),
+        )
+        .await;
+    expect_backend_frames(&mut backend, b"PBESP").await;
+    backend
+        .send(&[extended_select_one_result(), frame(b'Z', b"I")].concat())
+        .await;
+    expect_client_frames(&mut client, b"12TDCZ").await;
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "a request pipelined after the Sync must hold the assignment"
+    );
+
+    client
+        .send(&[bind_frame("", ""), execute_frame(""), sync_frame()].concat())
+        .await;
+    expect_backend_frames(&mut backend, b"BES").await;
+    backend
+        .send(&[extended_select_one_result(), frame(b'Z', b"I")].concat())
+        .await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
 }
