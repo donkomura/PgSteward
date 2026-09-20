@@ -1575,9 +1575,11 @@ name = "pgsteward-integration-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "pgsteward-core",
  "pgsteward-harness",
  "pgsteward-node",
+ "pgsteward-protocol",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
