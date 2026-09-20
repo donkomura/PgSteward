@@ -820,3 +820,160 @@ async fn a_parse_pipelined_after_the_sync_holds_the_assignment_past_the_ready_fo
     let (boundary, _pending, _server) = assignment.await.unwrap();
     assert_eq!(boundary.unwrap(), Boundary::Released);
 }
+
+fn copy_response(tag: u8, columns: i16) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_u8(0);
+    body.put_i16(columns);
+    for _ in 0..columns {
+        body.put_i16(0);
+    }
+    frame(tag, &body)
+}
+
+fn copy_data_frame(row: &str) -> Vec<u8> {
+    frame(b'd', row.as_bytes())
+}
+
+fn copy_done_frame() -> Vec<u8> {
+    frame(b'c', &[])
+}
+
+fn copy_fail_frame(reason: &str) -> Vec<u8> {
+    let mut body = BytesMut::new();
+    body.put_slice(reason.as_bytes());
+    body.put_u8(0);
+    frame(b'f', &body)
+}
+
+#[tokio::test]
+async fn a_copy_out_holds_the_assignment_until_the_stream_is_answered() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("COPY t TO STDOUT")).await;
+    expect_query(&mut backend, "COPY t TO STDOUT").await;
+    backend
+        .send(
+            &[
+                copy_response(b'H', 1),
+                copy_data_frame("1\n"),
+                copy_data_frame("2\n"),
+            ]
+            .concat(),
+        )
+        .await;
+    expect_client_frames(&mut client, b"Hdd").await;
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "a copy stream must hold the assignment until its ReadyForQuery"
+    );
+
+    backend
+        .send(&[copy_done_frame(), command_complete("COPY 2", b'I')].concat())
+        .await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    expect_client_frames(&mut client, b"c").await;
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+}
+
+#[tokio::test]
+async fn a_copy_in_holds_the_assignment_while_the_client_streams_its_rows() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("COPY t FROM STDIN")).await;
+    expect_query(&mut backend, "COPY t FROM STDIN").await;
+    backend.send(&copy_response(b'G', 1)).await;
+    expect_client_frames(&mut client, b"G").await;
+
+    client
+        .send(&[copy_data_frame("1\n"), copy_data_frame("2\n")].concat())
+        .await;
+    expect_backend_frames(&mut backend, b"dd").await;
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "a client still streaming rows must keep the assignment"
+    );
+
+    client.send(&copy_done_frame()).await;
+    expect_backend_frames(&mut backend, b"c").await;
+    backend.send(&command_complete("COPY 2", b'I')).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_mid_copy_in_leaves_the_assignment_unreleasable() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("COPY t FROM STDIN")).await;
+    expect_query(&mut backend, "COPY t FROM STDIN").await;
+    backend.send(&copy_response(b'G', 1)).await;
+    expect_client_frames(&mut client, b"G").await;
+    client.send(&copy_data_frame("1\n")).await;
+    expect_backend_frames(&mut backend, b"d").await;
+    drop(client);
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(
+        boundary.unwrap(),
+        Boundary::ClientClosed { may_release: false }
+    );
+}
+
+#[tokio::test]
+async fn a_copy_in_that_fails_inside_a_transaction_holds_the_assignment_until_the_rollback() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("BEGIN")).await;
+    expect_query(&mut backend, "BEGIN").await;
+    backend.send(&command_complete("BEGIN", b'T')).await;
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'T').await;
+
+    client.send(&query_frame("COPY t FROM STDIN")).await;
+    expect_query(&mut backend, "COPY t FROM STDIN").await;
+    backend.send(&copy_response(b'G', 1)).await;
+    expect_client_frames(&mut client, b"G").await;
+    client
+        .send(&[copy_data_frame("oops\n"), copy_fail_frame("bad input")].concat())
+        .await;
+    expect_backend_frames(&mut backend, b"df").await;
+    backend
+        .send(
+            &[
+                error_response("22P02", "invalid input syntax for type integer"),
+                frame(b'Z', b"E"),
+            ]
+            .concat(),
+        )
+        .await;
+    expect_client_frames(&mut client, b"EZ").await;
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "a failed copy leaves the transaction open, so the assignment stays"
+    );
+
+    client.send(&query_frame("ROLLBACK")).await;
+    expect_query(&mut backend, "ROLLBACK").await;
+    backend.send(&command_complete("ROLLBACK", b'I')).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+}
