@@ -1,3 +1,4 @@
+use std::future::{Future, ready};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -5,7 +6,7 @@ use std::time::Duration;
 
 use pgsteward_core::pool::{CloseServer, OpenServer, Pool, PoolError, PoolLimits};
 use pgsteward_core::rt::{Clock, tokio_rt::TokioRuntime};
-use pgsteward_core::server::ConnectError;
+use pgsteward_core::server::{ConnectError, QueryError, Row, SimpleQuery};
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -13,6 +14,8 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 struct FakeConnection {
     id: usize,
     live: Arc<AtomicUsize>,
+    statements: Arc<Mutex<Vec<String>>>,
+    reset_fails: bool,
 }
 
 impl Drop for FakeConnection {
@@ -28,6 +31,8 @@ struct Opener {
     live: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
     refusals: Arc<AtomicUsize>,
+    reset_failures: Arc<AtomicUsize>,
+    statements: Arc<Mutex<Vec<String>>>,
     delay: Duration,
 }
 
@@ -50,6 +55,20 @@ impl Opener {
         Self { delay, ..self }
     }
 
+    fn failing_reset(self, resets: usize) -> Self {
+        Self {
+            reset_failures: Arc::new(AtomicUsize::new(resets)),
+            ..self
+        }
+    }
+
+    fn statements(&self) -> Vec<String> {
+        self.statements
+            .lock()
+            .expect("statement log poisoned")
+            .clone()
+    }
+
     fn attempts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
     }
@@ -68,6 +87,14 @@ impl Opener {
 
     fn refuse_once(&self) -> bool {
         self.refusals
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                (left > 0).then(|| left - 1)
+            })
+            .is_ok()
+    }
+
+    fn fail_one_reset(&self) -> bool {
+        self.reset_failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 (left > 0).then(|| left - 1)
             })
@@ -94,12 +121,34 @@ impl OpenServer for Opener {
         Ok(FakeConnection {
             id,
             live: Arc::clone(&self.live),
+            statements: Arc::clone(&self.statements),
+            reset_fails: self.fail_one_reset(),
         })
     }
 }
 
 impl CloseServer for FakeConnection {
     async fn close(self) {}
+}
+
+impl SimpleQuery for FakeConnection {
+    fn simple_query(
+        &mut self,
+        sql: &str,
+    ) -> impl Future<Output = Result<Vec<Row>, QueryError>> + Send {
+        self.statements
+            .lock()
+            .expect("statement log poisoned")
+            .push(sql.to_owned());
+        ready(if self.reset_fails {
+            Err(QueryError::Server {
+                code: "57P01".to_owned(),
+                message: "the fake connection refuses to reset".to_owned(),
+            })
+        } else {
+            Ok(Vec::new())
+        })
+    }
 }
 
 fn pool(opener: Opener, slots: usize) -> Pool<Opener, TokioRuntime> {
@@ -483,4 +532,69 @@ async fn converging_to_the_grant_the_pool_already_holds_moves_nothing() {
     assert_eq!(pool.stats(), before);
     assert_eq!(opener.live(), 1);
     drop(assigned);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_released_connection_is_reset_before_it_goes_back_to_the_pool() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+
+    let assigned = pool.acquire().await.unwrap();
+    let id = assigned.id;
+    assigned.release().await;
+
+    assert_eq!(opener.statements(), vec!["DISCARD ALL".to_owned()]);
+    assert_eq!(pool.stats().idle, 1);
+
+    let next = pool.acquire().await.unwrap();
+
+    assert_eq!(next.id, id);
+    assert_eq!(opener.opened(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_connection_whose_reset_fails_is_discarded_and_its_slot_kept() {
+    let opener = Opener::default().failing_reset(1);
+    let pool = pool(opener.clone(), 1);
+
+    let assigned = pool.acquire().await.unwrap();
+    assigned.release().await;
+
+    assert_eq!(pool.stats().idle, 0);
+    assert_eq!(pool.stats().actual(), 0);
+    assert_eq!(pool.stats().slots, 1);
+    assert_eq!(opener.live(), 0);
+
+    let next = pool.acquire().await.unwrap();
+
+    assert_eq!(next.id, 1);
+    assert_eq!(opener.opened(), 2);
+    assert_eq!(
+        opener.peak(),
+        1,
+        "the connection that failed to reset must be closed before its replacement opens"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_slot_of_a_connection_whose_reset_fails_goes_to_the_waiting_client() {
+    let opener = Opener::default().failing_reset(1);
+    let pool = pool(opener.clone(), 1);
+
+    let assigned = pool.acquire().await.unwrap();
+    let waiting = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.acquire().await }
+    });
+    TokioRuntime::new().sleep(Duration::from_millis(10)).await;
+    assert_eq!(pool.stats().waiting, 1);
+
+    assigned.release().await;
+    let served = waiting.await.unwrap().unwrap();
+
+    assert_eq!(
+        served.id, 1,
+        "a client must never be handed the connection whose reset failed"
+    );
+    assert_eq!(opener.peak(), 1);
 }
