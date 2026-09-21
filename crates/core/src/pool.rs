@@ -8,7 +8,14 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use crate::rt::{Clock, Net};
-use crate::server::{ApplicationName, ConnectError, ServerConnection, ServerCredentials, connect};
+use crate::server::{
+    ApplicationName, ConnectError, ServerConnection, ServerCredentials, SimpleQuery, connect,
+};
+
+/// The statement that takes a server connection back to the state it had
+/// when it was opened: `SET`, prepared statements, temporary tables and
+/// advisory locks all go with it.
+const RESET: &str = "DISCARD ALL";
 
 pub trait OpenServer: Send + Sync + 'static {
     type Connection: Send + 'static;
@@ -234,6 +241,24 @@ impl<C> Assigned<C> {
         Self {
             connection: Some(connection),
             pool: Arc::clone(pool),
+        }
+    }
+}
+
+impl<C: SimpleQuery + CloseServer> Assigned<C> {
+    /// Gives the connection back to the pool, but only once the reset has
+    /// succeeded.
+    ///
+    /// A reset that fails leaves traces of this client where the next one
+    /// could read them, so the connection is discarded instead. The slot stays
+    /// with the pool and is filled again by a fresh connection.
+    pub async fn release(mut self) {
+        match self.simple_query(RESET).await {
+            Ok(_) => drop(self),
+            Err(error) => {
+                tracing::error!(%error, "resetting a server connection failed, discarding it");
+                self.discard().await;
+            }
         }
     }
 }

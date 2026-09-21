@@ -226,8 +226,11 @@ where
             Err(error) => return give_up(&mut client, error).await,
         };
         match serve_assignment(&mut client, &mut pending, &mut assigned).await {
-            Ok(Boundary::Released) => {}
-            Ok(Boundary::ClientClosed { may_release: true }) => return Ok(()),
+            Ok(Boundary::Released) => assigned.release().await,
+            Ok(Boundary::ClientClosed { may_release: true }) => {
+                assigned.release().await;
+                return Ok(());
+            }
             Ok(Boundary::ClientClosed { may_release: false }) => {
                 assigned.discard().await;
                 return Ok(());
