@@ -1,8 +1,15 @@
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
 use pgsteward_core::auth::TrustAll;
-use pgsteward_core::relay::{Boundary, RelayError, serve_assignment, session_mode};
-use pgsteward_core::server::{ApplicationName, ServerConnection, ServerCredentials};
+use pgsteward_core::pool::{OpenServer, Pool, PoolLimits};
+use pgsteward_core::relay::{
+    Boundary, RelayError, Welcome, serve_assignment, session_mode, transaction_mode,
+};
+use pgsteward_core::rt::tokio_rt::TokioRuntime;
+use pgsteward_core::server::{ApplicationName, ConnectError, ServerConnection, ServerCredentials};
 use pgsteward_core::session::{Accepted, ClientSession, accept};
 use pgsteward_protocol::framing::{Frame, decode_frame, decode_startup_frame, encode_frame};
 use pgsteward_protocol::startup::{
@@ -14,6 +21,9 @@ use tokio::task::JoinHandle;
 
 const MAX_FRAME: usize = 1 << 20;
 const DUPLEX_CAPACITY: usize = 64 * 1024;
+const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const POLL: Duration = Duration::from_millis(1);
+const ATTEMPTS: usize = 1000;
 
 const BACKEND_KEY: CancelKey = CancelKey {
     process_id: 4242,
@@ -976,4 +986,122 @@ async fn a_copy_in_that_fails_inside_a_transaction_holds_the_assignment_until_th
 
     let (boundary, _pending, _server) = assignment.await.unwrap();
     assert_eq!(boundary.unwrap(), Boundary::Released);
+}
+
+struct Backends {
+    opened: Arc<Mutex<Vec<Backend>>>,
+}
+
+impl Backends {
+    fn new() -> Self {
+        Self {
+            opened: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    async fn accept(&self) -> Backend {
+        for _ in 0..ATTEMPTS {
+            let taken = self.opened.lock().unwrap().pop();
+            if let Some(backend) = taken {
+                return backend;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        panic!("the pool opened no server connection");
+    }
+}
+
+impl Clone for Backends {
+    fn clone(&self) -> Self {
+        Self {
+            opened: Arc::clone(&self.opened),
+        }
+    }
+}
+
+impl OpenServer for Backends {
+    type Connection = ServerConnection<DuplexStream>;
+
+    async fn open(&self) -> Result<Self::Connection, ConnectError> {
+        let (backend, server) = server_connection().await;
+        self.opened.lock().unwrap().push(backend);
+        Ok(server)
+    }
+}
+
+fn pool_of(backends: Backends, slots: usize) -> Pool<Backends, TokioRuntime> {
+    Pool::new(
+        backends,
+        TokioRuntime::new(),
+        PoolLimits {
+            slots,
+            wait_timeout: WAIT_TIMEOUT,
+        },
+    )
+}
+
+fn spawn_transaction_mode(
+    session: ClientSession<DuplexStream>,
+    pool: Pool<Backends, TokioRuntime>,
+    welcome: Welcome,
+) -> JoinHandle<Result<(), RelayError>> {
+    tokio::spawn(async move { transaction_mode(session, &pool, &welcome).await })
+}
+
+async fn wait_until(what: &str, mut reached: impl FnMut() -> bool) {
+    for _ in 0..ATTEMPTS {
+        if reached() {
+            return;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    panic!("{what}");
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_while_it_waits_for_a_slot_gives_up_its_place() {
+    let backends = Backends::new();
+    let pool = pool_of(backends.clone(), 1);
+    let welcome = Welcome::default();
+
+    let (mut holder, session) = client_session(&[]).await;
+    let holding = spawn_transaction_mode(session, pool.clone(), welcome.clone());
+    holder.read_greeting().await;
+    let mut backend = backends.accept().await;
+    holder.send(&query_frame("BEGIN")).await;
+    expect_query(&mut backend, "BEGIN").await;
+    backend.send(&command_complete("BEGIN", b'T')).await;
+    expect_complete(&mut holder).await;
+    expect_ready(&mut holder, b'T').await;
+
+    let (mut leaving, session) = client_session(&[]).await;
+    let waiting = spawn_transaction_mode(session, pool.clone(), welcome.clone());
+    leaving.read_greeting().await;
+    leaving.send(&query_frame("SELECT 1")).await;
+    wait_until("the second client never reached the queue", || {
+        pool.stats().waiting == 1
+    })
+    .await;
+
+    drop(leaving);
+
+    wait_until(
+        "a client that went away kept its place in the queue",
+        || pool.stats().waiting == 0,
+    )
+    .await;
+    waiting.await.unwrap().unwrap();
+
+    holder.send(&query_frame("COMMIT")).await;
+    expect_query(&mut backend, "COMMIT").await;
+    backend.send(&command_complete("COMMIT", b'I')).await;
+    expect_query(&mut backend, "DISCARD ALL").await;
+    backend.send(&command_complete("DISCARD ALL", b'I')).await;
+    wait_until("the connection never went back to the pool", || {
+        pool.stats().idle == 1
+    })
+    .await;
+
+    drop(holder);
+    holding.await.unwrap().unwrap();
 }

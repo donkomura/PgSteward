@@ -165,6 +165,31 @@ async fn a_pool_without_a_grant_opens_nothing_and_reports_its_waiting_client() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_report_leaves_out_the_client_that_left_while_it_waited() {
+    let opener = Opener::default();
+    let pools = ProxyPools::new();
+    pools.insert(primary(), tenant("alice"), pool(opener.clone()));
+    let leaving = tokio::spawn({
+        let pool = pools.get(&primary(), &tenant("alice")).unwrap();
+        async move { pool.acquire().await }
+    });
+    settle().await;
+    assert_eq!(pools.report(0).get(&primary(), &tenant("alice")).demand, 1);
+
+    leaving.abort();
+    let _ = leaving.await;
+    settle().await;
+
+    let report = pools.report(1);
+    assert_eq!(
+        report.get(&primary(), &tenant("alice")).demand,
+        0,
+        "a client that went away asks for nothing"
+    );
+    assert_eq!(opener.live(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn converging_hands_the_granted_slot_to_the_waiting_client() {
     let opener = Opener::default();
     let pools = ProxyPools::new();

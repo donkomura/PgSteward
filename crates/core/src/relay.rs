@@ -1,4 +1,5 @@
 use std::io;
+use std::pin::pin;
 
 use std::sync::{Arc, OnceLock};
 
@@ -14,7 +15,7 @@ use pgsteward_protocol::startup::CancelKey;
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
-use crate::pool::{OpenServer, Pool, PoolError};
+use crate::pool::{Assigned, OpenServer, Pool, PoolError};
 use crate::rt::Clock;
 use crate::server::ServerConnection;
 use crate::session::ClientSession;
@@ -221,8 +222,9 @@ where
         if pending.first() == Some(&u8::from(FrontendTag::Terminate)) {
             return Ok(());
         }
-        let mut assigned = match pool.acquire().await {
-            Ok(assigned) => assigned,
+        let mut assigned = match slot_for(&mut client, &mut pending, pool).await {
+            Ok(Some(assigned)) => assigned,
+            Ok(None) => return Ok(()),
             Err(error) => return give_up(&mut client, error).await,
         };
         match serve_assignment(&mut client, &mut pending, &mut assigned).await {
@@ -239,6 +241,35 @@ where
                 assigned.discard().await;
                 return Err(error);
             }
+        }
+    }
+}
+
+/// Waits for a slot while watching the client that asked for one.
+///
+/// A client that goes away before it is served must stop waiting, so that the
+/// pool can take it out of the queue and the demand report can forget it.
+/// Whatever it pipelined while it waited stays in `pending` and reaches the
+/// server once the slot arrives.
+async fn slot_for<C, S, O, K>(
+    client: &mut C,
+    pending: &mut BytesMut,
+    pool: &Pool<O, K>,
+) -> Result<Option<Assigned<ServerConnection<S>>>, PoolError>
+where
+    C: AsyncRead + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    O: OpenServer<Connection = ServerConnection<S>>,
+    K: Clock,
+{
+    let mut acquiring = pin!(pool.acquire());
+    loop {
+        tokio::select! {
+            assigned = &mut acquiring => return assigned.map(Some),
+            read = fill(client, pending) => match read {
+                Ok(0) | Err(_) => return Ok(None),
+                Ok(_) => {}
+            },
         }
     }
 }
