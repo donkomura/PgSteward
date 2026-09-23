@@ -5,8 +5,8 @@ use pgsteward_protocol::backend::{
     encode_authentication_sasl, encode_authentication_sasl_continue,
     encode_authentication_sasl_final, encode_backend_key_data, encode_command_complete,
     encode_data_row, encode_empty_query_response, encode_encryption_response,
-    encode_error_response, encode_parameter_status, encode_ready_for_query,
-    encode_row_description, sqlstate,
+    encode_error_response, encode_parameter_status, encode_ready_for_query, encode_row_description,
+    sqlstate,
 };
 use pgsteward_protocol::message::TransactionStatus;
 use pgsteward_protocol::startup::CancelKey;

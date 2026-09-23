@@ -11,7 +11,11 @@ pub mod sqlstate {
     pub const INVALID_PASSWORD: &str = "28P01";
     pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
+    pub const SYNTAX_ERROR: &str = "42601";
 }
+
+const TEXT_OID: u32 = 25;
+const INT8_OID: u32 = 20;
 
 const AUTHENTICATION_OK: i32 = 0;
 const AUTHENTICATION_SASL: i32 = 10;
@@ -98,6 +102,38 @@ impl ErrorResponse {
     }
 }
 
+/// One column of a result set the admin console writes.
+///
+/// The values always travel in the text format, so the type only tells the
+/// client how to read them back; a count is `int8` because the widest thing
+/// counted is a `u32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Column<'a> {
+    name: &'a str,
+    oid: u32,
+    size: i16,
+}
+
+impl<'a> Column<'a> {
+    #[must_use]
+    pub const fn text(name: &'a str) -> Self {
+        Self {
+            name,
+            oid: TEXT_OID,
+            size: -1,
+        }
+    }
+
+    #[must_use]
+    pub const fn count(name: &'a str) -> Self {
+        Self {
+            name,
+            oid: INT8_OID,
+            size: 8,
+        }
+    }
+}
+
 pub fn encode_encryption_response(response: EncryptionResponse, out: &mut BytesMut) {
     out.put_u8(response.to_byte());
 }
@@ -177,4 +213,51 @@ fn put_field(out: &mut BytesMut, kind: u8, value: &str) {
     out.put_u8(kind);
     out.put_slice(value.as_bytes());
     out.put_u8(0);
+}
+
+/// Describes the columns of a result set the admin console computed itself.
+///
+/// The columns belong to no table, so the table and attribute numbers are
+/// zero, which is what PostgreSQL sends for a computed column as well.
+pub fn encode_row_description(columns: &[Column<'_>], out: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    body.put_i16(i16::try_from(columns.len()).unwrap_or(i16::MAX));
+    for column in columns {
+        body.put_slice(column.name.as_bytes());
+        body.put_u8(0);
+        body.put_i32(0);
+        body.put_i16(0);
+        body.put_u32(column.oid);
+        body.put_i16(column.size);
+        body.put_i32(-1);
+        body.put_i16(0);
+    }
+    encode_frame(BackendTag::RowDescription.into(), &body, out);
+}
+
+/// Writes one row, in the order the columns were described. `None` is a null.
+pub fn encode_data_row(values: &[Option<&str>], out: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    body.put_i16(i16::try_from(values.len()).unwrap_or(i16::MAX));
+    for value in values {
+        match value {
+            Some(value) => {
+                body.put_i32(i32::try_from(value.len()).unwrap_or(i32::MAX));
+                body.put_slice(value.as_bytes());
+            }
+            None => body.put_i32(-1),
+        }
+    }
+    encode_frame(BackendTag::DataRow.into(), &body, out);
+}
+
+pub fn encode_command_complete(tag: &str, out: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    body.put_slice(tag.as_bytes());
+    body.put_u8(0);
+    encode_frame(BackendTag::CommandComplete.into(), &body, out);
+}
+
+pub fn encode_empty_query_response(out: &mut BytesMut) {
+    encode_frame(BackendTag::EmptyQueryResponse.into(), &BytesMut::new(), out);
 }
