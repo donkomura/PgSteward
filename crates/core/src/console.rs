@@ -1,20 +1,195 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io;
 
 use bytes::BytesMut;
+use pgsteward_protocol::admin::{AdminCommand, parse};
 use pgsteward_protocol::backend::{
-    Column, encode_command_complete, encode_data_row, encode_row_description,
+    Column, ErrorResponse, encode_command_complete, encode_data_row, encode_empty_query_response,
+    encode_error_response, encode_parameter_status, encode_ready_for_query, encode_row_description,
+    sqlstate,
 };
+use pgsteward_protocol::framing::{FrameError, MAX_MESSAGE, decode_frame};
+use pgsteward_protocol::frontend::{FrontendError, decode_query};
+use pgsteward_protocol::message::{FrontendTag, MessageError, TransactionStatus};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::allocation::{AllocationTable, Holder, InstanceId, ProxyId};
 use crate::budget::TotalBudget;
 use crate::grant::TenantPolicy;
 use crate::pool::PoolStats;
+use crate::session::ClientSession;
 use crate::tenant::TenantId;
 
 /// What every table the console writes reports as its command tag, the way
 /// PostgreSQL answers a `SHOW`.
 const TAG: &str = "SHOW";
+
+/// The database a client names to reach the admin console instead of an
+/// instance. It is reserved: a tenant rule that names it is never consulted,
+/// so the console is reachable on every node without configuring it.
+pub const DATABASE: &str = "pgsteward";
+
+/// What this node answers today. The console's language is wider than this,
+/// and every refusal points back at the part that is served.
+const SERVED: &str = "This node serves SHOW POOLS, SHOW BUDGET and SHOW INSTANCES.";
+
+/// What the console tells about itself before it reads a command.
+///
+/// A console session runs no query on any instance, so none of these values
+/// comes from a server: they describe how the console itself writes its
+/// answers.
+const GREETING: [(&str, &str); 6] = [
+    (
+        "server_version",
+        concat!(env!("CARGO_PKG_VERSION"), " (PgSteward)"),
+    ),
+    ("server_encoding", "UTF8"),
+    ("client_encoding", "UTF8"),
+    ("DateStyle", "ISO"),
+    ("TimeZone", "UTC"),
+    ("standard_conforming_strings", "on"),
+];
+
+const READ_CHUNK: usize = 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConsoleError {
+    #[error("i/o error while serving the admin console: {0}")]
+    Io(#[from] io::Error),
+    #[error("malformed message: {0}")]
+    Frame(#[from] FrameError),
+    #[error(transparent)]
+    Message(#[from] MessageError),
+    #[error(transparent)]
+    Frontend(#[from] FrontendError),
+}
+
+/// Whether this client asked for the admin console rather than for an
+/// instance. The database alone decides it, so an operator reaches the console
+/// with whatever login the node already authenticates.
+#[must_use]
+pub fn is_console(tenant: &TenantId) -> bool {
+    tenant.database() == DATABASE
+}
+
+/// Answers admin commands on an authenticated session until the client leaves.
+///
+/// The session holds no server connection and takes no slot: it reads `view`
+/// once per command and writes the table from that one reading.
+pub async fn serve_console<S, V>(session: ClientSession<S>, view: V) -> Result<(), ConsoleError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    V: Fn() -> ConsoleView,
+{
+    let (mut stream, mut pending) = session.into_parts();
+    let mut greeting = BytesMut::new();
+    for (name, value) in GREETING {
+        encode_parameter_status(name, value, &mut greeting);
+    }
+    encode_ready_for_query(TransactionStatus::Idle, &mut greeting);
+    write(&mut stream, &greeting).await?;
+
+    let mut discarding = false;
+    loop {
+        let mut out = BytesMut::new();
+        let mut leaving = false;
+        while let Some(frame) = decode_frame(&mut pending, MAX_MESSAGE)? {
+            match FrontendTag::try_from(frame.tag)? {
+                FrontendTag::Terminate => {
+                    leaving = true;
+                    break;
+                }
+                FrontendTag::Sync => {
+                    discarding = false;
+                    encode_ready_for_query(TransactionStatus::Idle, &mut out);
+                }
+                _ if discarding => {}
+                FrontendTag::Query => {
+                    answer(decode_query(&frame.body)?, &view, &mut out);
+                    encode_ready_for_query(TransactionStatus::Idle, &mut out);
+                }
+                _ => {
+                    encode_error_response(&simple_query_only(), &mut out);
+                    discarding = true;
+                }
+            }
+        }
+        write(&mut stream, &out).await?;
+        if leaving {
+            return Ok(());
+        }
+        pending.reserve(READ_CHUNK);
+        if stream.read_buf(&mut pending).await? == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Writes the table `sql` asks for, or says why it cannot be answered.
+fn answer<V: Fn() -> ConsoleView>(sql: &str, view: &V, out: &mut BytesMut) {
+    let command = match parse(sql) {
+        Ok(command) => command,
+        Err(error) => {
+            encode_error_response(&error.response(), out);
+            return;
+        }
+    };
+    let unserved = match command {
+        AdminCommand::Empty => {
+            encode_empty_query_response(out);
+            return;
+        }
+        AdminCommand::ShowPools => {
+            show_pools(&view()).encode(out);
+            return;
+        }
+        AdminCommand::ShowBudget => {
+            show_budget(&view()).encode(out);
+            return;
+        }
+        AdminCommand::ShowInstances => {
+            show_instances(&view()).encode(out);
+            return;
+        }
+        AdminCommand::ShowClients => "SHOW CLIENTS",
+        AdminCommand::ShowServers => "SHOW SERVERS",
+        AdminCommand::ShowConfig => "SHOW CONFIG",
+        AdminCommand::Reload => "RELOAD",
+        AdminCommand::Pause => "PAUSE",
+        AdminCommand::Resume => "RESUME",
+        AdminCommand::SetInstance { .. } => "SET INSTANCE",
+        AdminCommand::SetTenant { .. } => "SET TENANT",
+    };
+    encode_error_response(
+        &ErrorResponse::error(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            format!(
+                "`{unserved}` is part of the admin console but this node does not serve it yet"
+            ),
+        )
+        .with_hint(SERVED),
+        out,
+    );
+}
+
+/// The console reads whole commands, so it has nowhere to put a parse that is
+/// bound and executed later.
+fn simple_query_only() -> ErrorResponse {
+    ErrorResponse::error(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "the admin console reads the simple query protocol only",
+    )
+    .with_hint("Send the command as a simple query.")
+}
+
+async fn write<S: AsyncWrite + Unpin>(stream: &mut S, out: &[u8]) -> io::Result<()> {
+    if out.is_empty() {
+        return Ok(());
+    }
+    stream.write_all(out).await?;
+    stream.flush().await
+}
 
 const POOL_COLUMNS: [Column<'static>; 13] = [
     Column::text("database"),
