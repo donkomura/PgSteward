@@ -9,7 +9,9 @@ use pgsteward_protocol::backend::{
     encode_ready_for_query, sqlstate,
 };
 use pgsteward_protocol::framing::{Frame, FrameError, MAX_MESSAGE, decode_frame, encode_frame};
+use pgsteward_protocol::frontend::FrontendError;
 use pgsteward_protocol::message::{BackendTag, FrontendTag, MessageError, TransactionStatus};
+use pgsteward_protocol::prepared::{PreparedStatements, Verdict};
 use pgsteward_protocol::ready::{ReadyTracker, TrackerError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
@@ -30,6 +32,8 @@ pub enum RelayError {
     Frame(#[from] FrameError),
     #[error(transparent)]
     Message(#[from] MessageError),
+    #[error(transparent)]
+    Frontend(#[from] FrontendError),
     #[error(transparent)]
     Tracker(#[from] TrackerError),
     #[error("the server closed the connection while a request was in flight")]
@@ -84,8 +88,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut tracker = ReadyTracker::new();
+    let mut statements = PreparedStatements::new();
     loop {
-        if forward_requests(pending, server, &mut tracker).await? == Requests::Terminated {
+        if forward_requests(client, pending, server, &mut tracker, &mut statements).await?
+            == Requests::Terminated
+        {
             return Ok(Boundary::ClientClosed {
                 may_release: tracker.may_release(),
             });
@@ -130,12 +137,19 @@ enum Requests {
     Terminated,
 }
 
-async fn forward_requests<S: AsyncRead + AsyncWrite + Unpin>(
+async fn forward_requests<C, S>(
+    client: &mut C,
     pending: &mut BytesMut,
     server: &mut ServerConnection<S>,
     tracker: &mut ReadyTracker,
-) -> Result<Requests, RelayError> {
+    statements: &mut PreparedStatements,
+) -> Result<Requests, RelayError>
+where
+    C: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut out = BytesMut::new();
+    let mut refusals = BytesMut::new();
     let mut requests = Requests::Drained;
     while let Some(frame) = decode_frame(pending, MAX_MESSAGE)? {
         let tag = FrontendTag::try_from(frame.tag)?;
@@ -143,13 +157,42 @@ async fn forward_requests<S: AsyncRead + AsyncWrite + Unpin>(
             requests = Requests::Terminated;
             break;
         }
-        tracker.on_frontend(tag);
-        encode_frame(frame.tag, &frame.body, &mut out);
+        match statements.on_frontend(tag, &frame.body)? {
+            Verdict::Forward => {
+                tracker.on_frontend(tag);
+                encode_frame(frame.tag, &frame.body, &mut out);
+            }
+            Verdict::Skip => {}
+            Verdict::Reject(statement) => {
+                encode_error_response(&no_such_statement(statement), &mut refusals);
+            }
+        }
     }
     if !out.is_empty() {
         server.forward(&out).await?;
     }
+    if !refusals.is_empty() {
+        client.write_all(&refusals).await?;
+        client.flush().await?;
+    }
     Ok(requests)
+}
+
+fn no_such_statement(statement: &str) -> ErrorResponse {
+    ErrorResponse::error(
+        sqlstate::INVALID_SQL_STATEMENT_NAME,
+        format!("prepared statement \"{statement}\" does not exist on this server connection"),
+    )
+    .with_detail(
+        "PgSteward does not support server-side prepared statements in transaction mode: \
+         a connection is handed to the next client at every transaction boundary, and the \
+         reset in between deallocates whatever was prepared on it.",
+    )
+    .with_hint(
+        "Turn them off in the client (Prisma: ?pgbouncer=true, JDBC: prepareThreshold=0, \
+         asyncpg: statement_cache_size=0, sqlx: statement_cache_capacity=0), or run this \
+         tenant in session mode.",
+    )
 }
 
 async fn fill<C: AsyncRead + Unpin>(client: &mut C, pending: &mut BytesMut) -> io::Result<usize> {

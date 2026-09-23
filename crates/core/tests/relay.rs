@@ -1263,6 +1263,16 @@ async fn expect_refusal(client: &mut Client, statement: &str) {
     }
 }
 
+async fn expect_sync_alone(backend: &mut Backend) {
+    let frame = tokio::time::timeout(ANSWER_TIMEOUT, backend.read_frame())
+        .await
+        .expect("the Sync that closes a refused window never reached the server");
+    assert_eq!(
+        frame.tag, b'S',
+        "nothing between a refused bind and its Sync may reach the server"
+    );
+}
+
 #[tokio::test]
 async fn a_bind_to_a_statement_this_assignment_never_parsed_never_reaches_the_server() {
     let (mut client, proxy) = client_link();
@@ -1274,7 +1284,7 @@ async fn a_bind_to_a_statement_this_assignment_never_parsed_never_reaches_the_se
         .await;
     expect_refusal(&mut client, "s1").await;
 
-    expect_backend_frames(&mut backend, b"S").await;
+    expect_sync_alone(&mut backend).await;
     backend.send(&frame(b'Z', b"I")).await;
 
     let (boundary, _pending, _server) = assignment.await.unwrap();
@@ -1324,7 +1334,7 @@ async fn a_refused_bind_leaves_the_transaction_status_to_the_server() {
         .send(&[bind_frame("", "s1"), execute_frame(""), sync_frame()].concat())
         .await;
     expect_refusal(&mut client, "s1").await;
-    expect_backend_frames(&mut backend, b"S").await;
+    expect_sync_alone(&mut backend).await;
     backend.send(&frame(b'Z', b"T")).await;
     expect_ready(&mut client, b'T').await;
 
@@ -1367,7 +1377,7 @@ async fn a_statement_parsed_before_the_boundary_is_gone_when_the_next_assignment
         .send(&[bind_frame("", "s1"), execute_frame(""), sync_frame()].concat())
         .await;
     expect_refusal(&mut client, "s1").await;
-    expect_backend_frames(&mut backend, b"S").await;
+    expect_sync_alone(&mut backend).await;
     backend.send(&frame(b'Z', b"I")).await;
     expect_ready(&mut client, b'I').await;
     expect_query(&mut backend, "DISCARD ALL").await;
