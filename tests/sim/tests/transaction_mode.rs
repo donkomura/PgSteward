@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
+use pgsteward_core::allocation::InstanceId;
 use pgsteward_core::auth::TrustAll;
+use pgsteward_core::cancel::{CancelRegistry, ProxyTag};
 use pgsteward_core::pool::{InstanceOpener, Pool, PoolLimits};
 use pgsteward_core::relay::{Welcome, transaction_mode};
 use pgsteward_core::rt::{Clock, Net, Spawner, turmoil_rt::TurmoilRuntime};
@@ -61,16 +63,20 @@ fn start_proxy(sim: &mut turmoil::Sim<'_>, slots: usize, wait_timeout: Duration)
             },
         );
         let welcome = Welcome::default();
+        let cancels = CancelRegistry::new(ProxyTag::new(1).unwrap());
+        let instance = InstanceId::new("postgres");
         let listener = rt.bind("0.0.0.0:6432").await?;
         loop {
             let (stream, _) = listener.accept().await?;
             let pool = pool.clone();
             let welcome = welcome.clone();
+            let cancels = cancels.clone();
+            let instance = instance.clone();
             rt.spawn(async move {
                 let Ok(Accepted::Session(session)) = accept(stream, TrustAll).await else {
                     return;
                 };
-                let _ = transaction_mode(session, &pool, &welcome).await;
+                let _ = transaction_mode(session, &pool, &welcome, &cancels, &instance).await;
             });
         }
     });

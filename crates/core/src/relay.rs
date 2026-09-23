@@ -11,10 +11,10 @@ use pgsteward_protocol::backend::{
 use pgsteward_protocol::framing::{Frame, FrameError, MAX_MESSAGE, decode_frame, encode_frame};
 use pgsteward_protocol::message::{BackendTag, FrontendTag, MessageError, TransactionStatus};
 use pgsteward_protocol::ready::{ReadyTracker, TrackerError};
-use pgsteward_protocol::startup::CancelKey;
-use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
+use crate::allocation::InstanceId;
+use crate::cancel::CancelRegistry;
 use crate::pool::{Assigned, OpenServer, Pool, PoolError};
 use crate::rt::Clock;
 use crate::server::ServerConnection;
@@ -193,6 +193,8 @@ pub async fn transaction_mode<C, S, O, K>(
     client: ClientSession<C>,
     pool: &Pool<O, K>,
     welcome: &Welcome,
+    cancels: &CancelRegistry,
+    instance: &InstanceId,
 ) -> Result<(), RelayError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -201,6 +203,7 @@ where
     K: Clock,
 {
     let (mut client, mut pending) = client.into_parts();
+    let ticket = cancels.issue();
     let mut greeting = BytesMut::new();
     match welcome.parameters(pool).await {
         Ok(parameters) => {
@@ -210,7 +213,7 @@ where
         }
         Err(error) => return give_up(&mut client, error).await,
     }
-    encode_backend_key_data(cancel_key(), &mut greeting);
+    encode_backend_key_data(ticket.key(), &mut greeting);
     encode_ready_for_query(TransactionStatus::Idle, &mut greeting);
     client.write_all(&greeting).await?;
     client.flush().await?;
@@ -227,7 +230,10 @@ where
             Ok(None) => return Ok(()),
             Err(error) => return give_up(&mut client, error).await,
         };
-        match serve_assignment(&mut client, &mut pending, &mut assigned).await {
+        ticket.aim(instance.clone(), assigned.backend_key());
+        let served = serve_assignment(&mut client, &mut pending, &mut assigned).await;
+        ticket.stand_down();
+        match served {
             Ok(Boundary::Released) => assigned.release().await,
             Ok(Boundary::ClientClosed { may_release: true }) => {
                 assigned.release().await;
@@ -271,14 +277,6 @@ where
                 Ok(_) => {}
             },
         }
-    }
-}
-
-fn cancel_key() -> CancelKey {
-    let mut rng = rand::rng();
-    CancelKey {
-        process_id: rng.random(),
-        secret_key: rng.random(),
     }
 }
 
