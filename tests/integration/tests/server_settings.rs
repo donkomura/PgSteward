@@ -6,6 +6,7 @@ use pgsteward_core::inspect::{
 };
 use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::server::{ApplicationName, ServerCredentials, connect};
+use pgsteward_harness::server_tls;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -56,6 +57,7 @@ async fn the_server_limits_and_the_timeout_settings_are_read_as_the_server_repor
         &format!("127.0.0.1:{port}"),
         &credentials(),
         &ApplicationName::new("integration"),
+        &server_tls(),
     )
     .await
     .unwrap();
@@ -92,6 +94,7 @@ async fn the_foreign_connections_leave_out_the_ones_this_system_opened() {
         &format!("127.0.0.1:{port}"),
         &credentials(),
         &ApplicationName::new("integration"),
+        &server_tls(),
     )
     .await
     .unwrap();

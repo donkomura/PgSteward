@@ -6,6 +6,7 @@ use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::rt::{Net, Spawner};
 use pgsteward_core::server::{ApplicationName, ServerCredentials, connect};
 use pgsteward_core::session::{Accepted, accept};
+use pgsteward_harness::server_tls;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -39,6 +40,7 @@ async fn start_proxy(rt: &TokioRuntime, server_addr: String) -> SocketAddr {
                     &server_addr,
                     &credentials(),
                     &ApplicationName::new(IDENTIFIER),
+                    &server_tls(),
                 )
                 .await
                 .unwrap();

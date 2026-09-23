@@ -22,7 +22,7 @@ use pgsteward_core::server::{
 };
 use pgsteward_core::session::{Accepted, ClientSession};
 use pgsteward_core::tenant::TenantId;
-use pgsteward_core::tls::ClientTls;
+use pgsteward_core::tls::{ClientTls, MaybeTls, ServerTls};
 use pgsteward_protocol::backend::{ErrorResponse, encode_error_response, sqlstate};
 use pgsteward_protocol::startup::CancelKey;
 use pgsteward_sched::fair::WeightedMaxMinFair;
@@ -136,6 +136,7 @@ pub async fn serve<R: Runtime>(
         return Err(ServeError::SessionMode);
     }
     let monitor = node.monitor_credentials().ok_or(ServeError::NoMonitor)?;
+    let server_tls = Arc::new(node.server_tls()?);
     let policies = cluster.policies();
     let proxy = ProxyId::new(node.node.listen.to_string());
     let coordinator = Arc::new(InProcessCoordinator::new(
@@ -152,6 +153,7 @@ pub async fn serve<R: Runtime>(
             instance.id(),
             instance.address(),
             monitor.clone(),
+            Arc::clone(&server_tls),
             options,
             Arc::clone(&coordinator),
         )
@@ -195,6 +197,7 @@ pub async fn serve<R: Runtime>(
         limit: node.client_limit(),
         credentials: Arc::new(node.client_credentials()?),
         tls: node.client_tls()?.map(Arc::new),
+        server_tls,
         policies: Arc::new(policies),
         addresses: Arc::new(addresses),
         node: Arc::new(node),
@@ -220,9 +223,10 @@ struct Observer<R: Runtime> {
     instance: InstanceId,
     address: String,
     credentials: ServerCredentials,
+    tls: Arc<ServerTls>,
     interval: Duration,
     budget: InstanceBudget,
-    connection: Option<ServerConnection<R::Stream>>,
+    connection: Option<ServerConnection<MaybeTls<R::Stream>>>,
     coordinator: Arc<Coordinator>,
 }
 
@@ -232,15 +236,22 @@ impl<R: Runtime> Observer<R> {
         instance: InstanceId,
         address: String,
         credentials: ServerCredentials,
+        tls: Arc<ServerTls>,
         options: ServeOptions,
         coordinator: Arc<Coordinator>,
     ) -> Result<Self, ServeError> {
-        let mut connection = connect(&rt, &address, &credentials, &ApplicationName::new(MONITOR))
-            .await
-            .map_err(|source| ServeError::Connect {
-                instance: instance.clone(),
-                source,
-            })?;
+        let mut connection = connect(
+            &rt,
+            &address,
+            &credentials,
+            &ApplicationName::new(MONITOR),
+            &tls,
+        )
+        .await
+        .map_err(|source| ServeError::Connect {
+            instance: instance.clone(),
+            source,
+        })?;
         let inspect = |source| ServeError::Inspect {
             instance: instance.clone(),
             source,
@@ -262,6 +273,7 @@ impl<R: Runtime> Observer<R> {
             instance,
             address,
             credentials,
+            tls,
             interval: options.observe_interval,
             budget,
             connection: Some(connection),
@@ -297,6 +309,7 @@ impl<R: Runtime> Observer<R> {
                 &self.address,
                 &self.credentials,
                 &ApplicationName::new(MONITOR),
+                &self.tls,
             )
             .await
             .map_err(|source| ServeError::Connect {
@@ -321,6 +334,7 @@ struct Front<R: Runtime> {
     limit: ClientLimit,
     credentials: Arc<ClientCredentials>,
     tls: Option<Arc<ClientTls>>,
+    server_tls: Arc<ServerTls>,
     policies: Arc<Policies>,
     addresses: Arc<BTreeMap<InstanceId, String>>,
     node: Arc<NodeConfig>,
@@ -336,6 +350,7 @@ impl<R: Runtime> Clone for Front<R> {
             limit: self.limit.clone(),
             credentials: Arc::clone(&self.credentials),
             tls: self.tls.clone(),
+            server_tls: Arc::clone(&self.server_tls),
             policies: Arc::clone(&self.policies),
             addresses: Arc::clone(&self.addresses),
             node: Arc::clone(&self.node),
@@ -423,6 +438,7 @@ impl<R: Runtime> Front<R> {
                 self.addresses[instance].clone(),
                 self.node.server_credentials(tenant),
                 ApplicationName::new(PROXY),
+                Arc::clone(&self.server_tls),
             ),
             self.rt.clone(),
             PoolLimits {

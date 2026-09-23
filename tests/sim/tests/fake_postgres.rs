@@ -44,6 +44,7 @@ fn the_fake_postgres_answers_the_startup_packet() {
             "db:5432",
             &credentials(),
             &ApplicationName::new(IDENTIFIER),
+            &ServerTls::disabled(),
         )
         .await?;
         assert_ne!(
@@ -81,7 +82,14 @@ fn every_server_connection_reports_its_own_backend() {
         let rt = TurmoilRuntime::new();
         let application_name = ApplicationName::new(IDENTIFIER);
         for _ in 0..2 {
-            let mut server = connect(&rt, "db:5432", &credentials(), &application_name).await?;
+            let mut server = connect(
+                &rt,
+                "db:5432",
+                &credentials(),
+                &application_name,
+                &ServerTls::disabled(),
+            )
+            .await?;
             let rows = server
                 .simple_query("SELECT pg_backend_pid()")
                 .await

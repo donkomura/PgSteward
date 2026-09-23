@@ -13,7 +13,7 @@ use pgsteward_core::policy::{Policies, TenantRule};
 use pgsteward_core::scram::ScramVerifier;
 use pgsteward_core::server::ServerCredentials;
 use pgsteward_core::tenant::TenantId;
-use pgsteward_core::tls::{ClientTls, TlsError};
+use pgsteward_core::tls::{ClientTls, ServerTls, SslMode, TlsError};
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +94,7 @@ pub struct NodeSection {
     pub coordinator: String,
     pub max_client_connections: u32,
     pub tls: Option<TlsSection>,
+    pub server_tls: Option<ServerTlsSection>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +102,38 @@ pub struct NodeSection {
 pub struct TlsSection {
     pub cert: PathBuf,
     pub key: PathBuf,
+}
+
+/// How far this node goes to encrypt the connections it opens to an instance.
+/// The modes are libpq's `sslmode`, and `root_cert` is what `verify-ca` and
+/// `verify-full` check the certificate against.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerTlsSection {
+    pub mode: SslModeSection,
+    pub root_cert: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SslModeSection {
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl From<SslModeSection> for SslMode {
+    fn from(mode: SslModeSection) -> Self {
+        match mode {
+            SslModeSection::Disable => Self::Disable,
+            SslModeSection::Prefer => Self::Prefer,
+            SslModeSection::Require => Self::Require,
+            SslModeSection::VerifyCa => Self::VerifyCa,
+            SslModeSection::VerifyFull => Self::VerifyFull,
+        }
+    }
 }
 
 impl NodeConfig {
@@ -139,8 +172,39 @@ impl NodeConfig {
                     ConfigError::invalid("node.tls.cert", source.to_string())
                 }
                 TlsError::PrivateKey(_) => ConfigError::invalid("node.tls.key", source.to_string()),
-                TlsError::Unusable(_) => ConfigError::invalid("node.tls", source.to_string()),
+                other => ConfigError::invalid("node.tls", other.to_string()),
             })
+    }
+
+    /// How this node encrypts the connections it opens to an instance. Without
+    /// a `[node.server_tls]` section it asks for encryption and carries on in
+    /// the clear when the instance does not offer it, as libpq does.
+    pub fn server_tls(&self) -> Result<ServerTls, ConfigError> {
+        let Some(section) = &self.node.server_tls else {
+            return ServerTls::new(SslMode::default(), None).map_err(server_tls_error);
+        };
+        let mode = SslMode::from(section.mode);
+        let root = match (&section.root_cert, mode) {
+            (Some(path), SslMode::VerifyCa | SslMode::VerifyFull) => {
+                Some(read_pem(path, "node.server_tls.root_cert")?)
+            }
+            (Some(_), mode) => {
+                return Err(ConfigError::invalid(
+                    "node.server_tls.root_cert",
+                    format!(
+                        "`{mode}` never reads a root certificate; use verify-ca or verify-full"
+                    ),
+                ));
+            }
+            (None, SslMode::VerifyCa | SslMode::VerifyFull) => {
+                return Err(ConfigError::invalid(
+                    "node.server_tls.root_cert",
+                    format!("`{mode}` verifies the certificate and needs a root certificate"),
+                ));
+            }
+            (None, _) => None,
+        };
+        ServerTls::new(mode, root.as_deref()).map_err(server_tls_error)
     }
 
     /// A server connection for a tenant logs in as the tenant's user to the
@@ -254,6 +318,15 @@ pub struct TenantSection {
     pub max: Option<u32>,
     #[serde(default = "default_weight")]
     pub weight: u32,
+}
+
+fn server_tls_error(source: TlsError) -> ConfigError {
+    match source {
+        TlsError::RootCertificate(_) | TlsError::NoRootCertificate | TlsError::Verifier(_) => {
+            ConfigError::invalid("node.server_tls.root_cert", source.to_string())
+        }
+        other => ConfigError::invalid("node.server_tls", other.to_string()),
+    }
 }
 
 fn read_pem(path: &Path, key: &str) -> Result<Vec<u8>, ConfigError> {

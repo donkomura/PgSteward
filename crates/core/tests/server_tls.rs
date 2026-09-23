@@ -24,9 +24,9 @@ const SERVER_NAME: &str = "db-primary.internal";
 const ANOTHER_NAME: &str = "db-replica-1.internal";
 
 struct Authority {
-    cert_pem: String,
-    key_pem: String,
-    root_pem: String,
+    certificate: String,
+    key: String,
+    root: String,
 }
 
 fn authority(name: &str) -> Authority {
@@ -41,18 +41,18 @@ fn authority(name: &str) -> Authority {
     let cert = params.signed_by(&key, &issuer).unwrap();
 
     Authority {
-        cert_pem: cert.pem(),
-        key_pem: key.serialize_pem(),
-        root_pem: root.pem(),
+        certificate: cert.pem(),
+        key: key.serialize_pem(),
+        root: root.pem(),
     }
 }
 
 impl Authority {
     fn acceptor(&self) -> TlsAcceptor {
-        let chain = CertificateDer::pem_slice_iter(self.cert_pem.as_bytes())
+        let chain = CertificateDer::pem_slice_iter(self.certificate.as_bytes())
             .collect::<Result<Vec<CertificateDer<'static>>, _>>()
             .unwrap();
-        let key = PrivateKeyDer::from_pem_slice(self.key_pem.as_bytes()).unwrap();
+        let key = PrivateKeyDer::from_pem_slice(self.key.as_bytes()).unwrap();
         let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -63,7 +63,7 @@ impl Authority {
     }
 
     fn root(&self) -> &[u8] {
-        self.root_pem.as_bytes()
+        self.root.as_bytes()
     }
 }
 
@@ -105,7 +105,7 @@ async fn read_startup_request<S: AsyncRead + Unpin>(
     }
 }
 
-/// The server side of the SSLRequest exchange: read the request and answer with
+/// The server side of the `SSLRequest` exchange: read the request and answer with
 /// the one byte, leaving the stream where the startup packet follows.
 async fn answer_encryption_request(stream: &mut DuplexStream, answer: u8) {
     let mut buf = BytesMut::new();

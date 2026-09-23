@@ -6,6 +6,7 @@ use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::server::{ApplicationName, ServerCredentials, SimpleQuery};
 use pgsteward_harness::cap::CapMonitor;
 use pgsteward_harness::pg_stat_activity::PgStatActivity;
+use pgsteward_harness::server_tls;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -58,6 +59,7 @@ async fn the_pool_serves_more_clients_than_it_has_slots_without_exceeding_them()
             format!("127.0.0.1:{port}"),
             credentials(),
             application_name,
+            server_tls(),
         ),
         rt,
         PoolLimits {

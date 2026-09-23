@@ -7,6 +7,7 @@ use pgsteward_core::server::{
     ApplicationName, ConnectError, HandshakeError, QueryError, ServerConnection, ServerCredentials,
     SimpleQuery, connect,
 };
+use pgsteward_core::tls::ServerTls;
 use pgsteward_protocol::framing::{Frame, decode_frame, decode_startup_frame, encode_frame};
 use pgsteward_protocol::startup::{
     CancelKey, ProtocolVersion, StartupMessage, StartupRequest, decode_startup,
@@ -725,6 +726,7 @@ async fn connect_reports_an_unreachable_server() {
         &addr.to_string(),
         &credentials(None),
         &ApplicationName::new("node-1"),
+        &ServerTls::disabled(),
     )
     .await
     .unwrap_err();
@@ -756,6 +758,7 @@ async fn connect_runs_the_handshake_over_the_runtime_network() {
         &addr.to_string(),
         &credentials(None),
         &ApplicationName::new("node-1"),
+        &ServerTls::disabled(),
     )
     .await
     .unwrap();
