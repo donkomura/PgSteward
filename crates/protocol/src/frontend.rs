@@ -49,8 +49,67 @@ pub fn decode_sasl_initial_response(body: &[u8]) -> Result<SaslInitialResponse<'
 }
 
 fn malformed(reason: &'static str) -> FrontendError {
-    FrontendError::MalformedBody {
-        tag: FrontendTag::Password,
-        reason,
+    malformed_body(FrontendTag::Password, reason)
+}
+
+fn malformed_body(tag: FrontendTag, reason: &'static str) -> FrontendError {
+    FrontendError::MalformedBody { tag, reason }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseTarget<'a> {
+    Statement(&'a str),
+    Portal(&'a str),
+}
+
+pub fn decode_parse(body: &[u8]) -> Result<&str, FrontendError> {
+    let (statement, _) = cstr(
+        body,
+        FrontendTag::Parse,
+        "the statement name is not terminated",
+    )?;
+    Ok(statement)
+}
+
+pub fn decode_bind(body: &[u8]) -> Result<&str, FrontendError> {
+    let (_, rest) = cstr(body, FrontendTag::Bind, "the portal name is not terminated")?;
+    let (statement, _) = cstr(
+        rest,
+        FrontendTag::Bind,
+        "the statement name is not terminated",
+    )?;
+    Ok(statement)
+}
+
+pub fn decode_close(body: &[u8]) -> Result<CloseTarget<'_>, FrontendError> {
+    let (target, rest) = body
+        .split_first()
+        .ok_or_else(|| malformed_body(FrontendTag::Close, "the target is missing"))?;
+    let (name, _) = cstr(
+        rest,
+        FrontendTag::Close,
+        "the target name is not terminated",
+    )?;
+    match target {
+        b'S' => Ok(CloseTarget::Statement(name)),
+        b'P' => Ok(CloseTarget::Portal(name)),
+        _ => Err(malformed_body(
+            FrontendTag::Close,
+            "the target is neither a statement nor a portal",
+        )),
     }
+}
+
+fn cstr<'a>(
+    body: &'a [u8],
+    tag: FrontendTag,
+    unterminated: &'static str,
+) -> Result<(&'a str, &'a [u8]), FrontendError> {
+    let terminator = body
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| malformed_body(tag, unterminated))?;
+    let text = std::str::from_utf8(&body[..terminator])
+        .map_err(|_| malformed_body(tag, "a name is not valid UTF-8"))?;
+    Ok((text, &body[terminator + 1..]))
 }
