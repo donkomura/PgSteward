@@ -74,6 +74,7 @@ Node-local config (role, listener, coordinator entry point, client-connection ca
 
 ## Workflow
 
+- **Read the progress table in `docs/plan.md` before starting any work, and read it on an up-to-date `main`** (`git fetch origin && git merge --ff-only origin/main`). The table is the only record of which step is done; on a stale `main` it names a step that is already merged, and the work gets written a second time.
 - Move into a worktree with `git wt <branch>` before changing anything.
 - For each step, write the tests first, confirm they fail because nothing is implemented, then implement. Do not change the tests while implementing.
 - Do not write code comments.

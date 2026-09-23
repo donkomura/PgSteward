@@ -278,6 +278,65 @@ async fn clients_are_served_in_the_order_they_started_waiting() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_client_that_leaves_while_it_waits_gives_up_its_place_in_the_queue() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+    let held = pool.acquire().await.unwrap();
+    let leaving = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.acquire().await }
+    });
+    TokioRuntime::new().sleep(Duration::from_millis(10)).await;
+    assert_eq!(pool.stats().waiting, 1);
+
+    leaving.abort();
+    let _ = leaving.await;
+    TokioRuntime::new().sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(
+        pool.stats().waiting,
+        0,
+        "a client that went away must leave the queue"
+    );
+    assert_eq!(
+        pool.stats().demand(),
+        1,
+        "only the client holding the connection still asks for one"
+    );
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_freed_connection_goes_to_the_client_behind_the_one_that_left() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+    let held = pool.acquire().await.unwrap();
+    let leaving = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.acquire().await }
+    });
+    TokioRuntime::new().sleep(Duration::from_millis(10)).await;
+    let staying = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.acquire().await }
+    });
+    TokioRuntime::new().sleep(Duration::from_millis(10)).await;
+    assert_eq!(pool.stats().waiting, 2);
+
+    leaving.abort();
+    let _ = leaving.await;
+    TokioRuntime::new().sleep(Duration::from_millis(10)).await;
+    assert_eq!(pool.stats().waiting, 1);
+
+    let id = held.id;
+    drop(held);
+    let served = staying.await.unwrap().unwrap();
+
+    assert_eq!(served.id, id);
+    assert_eq!(opener.opened(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_client_that_waits_longer_than_the_wait_timeout_is_refused() {
     let opener = Opener::default();
     let pool = pool(opener.clone(), 1);

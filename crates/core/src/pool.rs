@@ -180,6 +180,7 @@ impl<O: OpenServer, K: Clock> Pool<O, K> {
         ticket: u64,
         mut receiver: oneshot::Receiver<Handoff<O::Connection>>,
     ) -> Result<Handoff<O::Connection>, PoolError> {
+        let _queued = Queued::new(&self.inner, ticket);
         let started = self.clock.now();
         tokio::select! {
             handoff = &mut receiver => handoff.map_err(|_| PoolError::Closed),
@@ -338,6 +339,31 @@ impl<C> State<C> {
 struct Waiter<C> {
     ticket: u64,
     handoff: oneshot::Sender<Handoff<C>>,
+}
+
+/// Takes a client out of the queue as soon as it stops waiting, whichever way
+/// it stops: served, refused, or gone before either happened.
+///
+/// A client that went away must not be reported as demand, and the coordinator
+/// must not grant a slot for it.
+struct Queued<C> {
+    pool: Arc<Inner<C>>,
+    ticket: u64,
+}
+
+impl<C> Queued<C> {
+    fn new(pool: &Arc<Inner<C>>, ticket: u64) -> Self {
+        Self {
+            pool: Arc::clone(pool),
+            ticket,
+        }
+    }
+}
+
+impl<C> Drop for Queued<C> {
+    fn drop(&mut self) {
+        self.pool.give_up(self.ticket);
+    }
 }
 
 enum Handoff<C> {
