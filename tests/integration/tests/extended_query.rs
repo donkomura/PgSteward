@@ -60,7 +60,8 @@ async fn start_proxy(
             let cancels = cancels.clone();
             let instance = instance.clone();
             serve_rt.spawn(async move {
-                let Accepted::Session(session) = accept(stream, TrustAll).await.unwrap() else {
+                let Accepted::Session(session) = accept(stream, TrustAll, None).await.unwrap()
+                else {
                     panic!("expected an authenticated session");
                 };
                 transaction_mode(session, &pool, &welcome, &cancels, &instance)

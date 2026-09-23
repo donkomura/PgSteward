@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pgsteward_core::admission::ClientLimit;
@@ -13,6 +13,7 @@ use pgsteward_core::policy::{Policies, TenantRule};
 use pgsteward_core::scram::ScramVerifier;
 use pgsteward_core::server::ServerCredentials;
 use pgsteward_core::tenant::TenantId;
+use pgsteward_core::tls::{ClientTls, TlsError};
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -121,6 +122,25 @@ impl NodeConfig {
             credentials.insert(user.clone(), AuthMethod::ScramSha256(verifier));
         }
         Ok(credentials)
+    }
+
+    /// What this node terminates client TLS with, or none when `[node.tls]` is
+    /// absent and clients are told this node does not encrypt.
+    pub fn client_tls(&self) -> Result<Option<ClientTls>, ConfigError> {
+        let Some(tls) = &self.node.tls else {
+            return Ok(None);
+        };
+        let certificates = read_pem(&tls.cert, "node.tls.cert")?;
+        let key = read_pem(&tls.key, "node.tls.key")?;
+        ClientTls::from_pem(&certificates, &key)
+            .map(Some)
+            .map_err(|source| match source {
+                TlsError::Certificate(_) | TlsError::NoCertificate => {
+                    ConfigError::invalid("node.tls.cert", source.to_string())
+                }
+                TlsError::PrivateKey(_) => ConfigError::invalid("node.tls.key", source.to_string()),
+                TlsError::Unusable(_) => ConfigError::invalid("node.tls", source.to_string()),
+            })
     }
 
     /// A server connection for a tenant logs in as the tenant's user to the
@@ -234,6 +254,12 @@ pub struct TenantSection {
     pub max: Option<u32>,
     #[serde(default = "default_weight")]
     pub weight: u32,
+}
+
+fn read_pem(path: &Path, key: &str) -> Result<Vec<u8>, ConfigError> {
+    std::fs::read(path).map_err(|source| {
+        ConfigError::invalid(key, format!("cannot read `{}`: {source}", path.display()))
+    })
 }
 
 fn default_weight() -> u32 {

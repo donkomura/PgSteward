@@ -5,6 +5,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::auth::Credentials;
 use crate::session::{AcceptError, Accepted, accept, refuse_over_limit};
+use crate::tls::{ClientTls, MaybeTls};
 
 /// How many client connections this node holds at once. Whether to take a
 /// client is the proxy's own decision (design-doc 8.2), so the limit is
@@ -62,11 +63,12 @@ impl ClientLimit {
         &self,
         mut stream: S,
         credentials: C,
-    ) -> Result<(Admitted, Accepted<S>), AcceptError> {
+        tls: Option<&ClientTls>,
+    ) -> Result<(Admitted, Accepted<MaybeTls<S>>), AcceptError> {
         let Some(admitted) = self.admit() else {
             return Err(refuse_over_limit(&mut stream, self.max).await);
         };
-        Ok((admitted, accept(stream, credentials).await?))
+        Ok((admitted, accept(stream, credentials, tls).await?))
     }
 }
 

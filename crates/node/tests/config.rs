@@ -441,3 +441,61 @@ fn an_instance_name_with_a_port_is_reached_on_that_port() {
 
     assert_eq!(config.instance[0].address(), "db-primary.internal:5433");
 }
+
+#[test]
+fn node_local_config_loads_the_certificate_and_key_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let certified = rcgen::generate_simple_self_signed(vec!["pgsteward.test".to_owned()]).unwrap();
+    let cert = dir.path().join("tls.crt");
+    let key = dir.path().join("tls.key");
+    std::fs::write(&cert, certified.cert.pem()).unwrap();
+    std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
+    let config = NodeConfig::parse(&tls_paths(&cert, &key)).unwrap();
+
+    assert!(config.client_tls().unwrap().is_some());
+}
+
+#[test]
+fn node_local_config_without_tls_terminates_nothing() {
+    let without_tls = NODE_LOCAL.split("[node.tls]").next().unwrap();
+    let config = NodeConfig::parse(without_tls).unwrap();
+
+    assert!(config.client_tls().unwrap().is_none());
+}
+
+#[test]
+fn a_certificate_that_cannot_be_read_names_the_key_it_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("missing.crt");
+    let key = dir.path().join("tls.key");
+    std::fs::write(&key, "").unwrap();
+    let config = NodeConfig::parse(&tls_paths(&cert, &key)).unwrap();
+
+    let err = config.client_tls().unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+    assert!(err.to_string().contains("node.tls.cert"), "{err}");
+}
+
+#[test]
+fn a_key_that_is_not_a_key_names_the_key_it_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let certified = rcgen::generate_simple_self_signed(vec!["pgsteward.test".to_owned()]).unwrap();
+    let cert = dir.path().join("tls.crt");
+    let key = dir.path().join("tls.key");
+    std::fs::write(&cert, certified.cert.pem()).unwrap();
+    std::fs::write(&key, "not a key at all").unwrap();
+    let config = NodeConfig::parse(&tls_paths(&cert, &key)).unwrap();
+
+    let err = config.client_tls().unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+    assert!(err.to_string().contains("node.tls.key"), "{err}");
+}
+
+fn tls_paths(cert: &std::path::Path, key: &std::path::Path) -> String {
+    format!(
+        "{}\n[node.tls]\ncert = \"{}\"\nkey = \"{}\"\n",
+        NODE_LOCAL.split("[node.tls]").next().unwrap(),
+        cert.display(),
+        key.display(),
+    )
+}

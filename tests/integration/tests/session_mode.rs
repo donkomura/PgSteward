@@ -30,7 +30,8 @@ async fn start_proxy(rt: &TokioRuntime, server_addr: String) -> SocketAddr {
         while let Ok((stream, _)) = listener.accept().await {
             let server_addr = server_addr.clone();
             serve_rt.spawn(async move {
-                let Accepted::Session(session) = accept(stream, TrustAll).await.unwrap() else {
+                let Accepted::Session(session) = accept(stream, TrustAll, None).await.unwrap()
+                else {
                     panic!("expected an authenticated session");
                 };
                 let server = connect(
