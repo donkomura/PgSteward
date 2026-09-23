@@ -3,6 +3,7 @@ use std::time::Duration;
 use pgsteward_core::allocation::InstanceId;
 use pgsteward_core::auth::{AuthMethod, Credentials};
 use pgsteward_core::tenant::TenantId;
+use pgsteward_core::tls::SslMode;
 use pgsteward_node::config::{ClusterConfig, ConfigError, NodeConfig, PoolMode, Role};
 
 const NODE_LOCAL: &str = r#"
@@ -498,4 +499,85 @@ fn tls_paths(cert: &std::path::Path, key: &std::path::Path) -> String {
         cert.display(),
         key.display(),
     )
+}
+
+#[test]
+fn a_node_without_a_server_tls_section_prefers_encryption_on_db_connections() {
+    let config = NodeConfig::parse(NODE_LOCAL).unwrap();
+
+    assert_eq!(config.server_tls().unwrap().mode(), SslMode::Prefer);
+}
+
+#[test]
+fn the_server_tls_mode_names_how_far_the_certificate_is_verified() {
+    let config = NodeConfig::parse(&server_tls("require", None)).unwrap();
+
+    assert_eq!(config.server_tls().unwrap().mode(), SslMode::Require);
+}
+
+#[test]
+fn a_verifying_mode_loads_the_root_certificate_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["db-primary.internal".to_owned()]).unwrap();
+    let root = dir.path().join("ca.crt");
+    std::fs::write(&root, certified.cert.pem()).unwrap();
+    let config = NodeConfig::parse(&server_tls("verify-full", Some(&root))).unwrap();
+
+    assert_eq!(config.server_tls().unwrap().mode(), SslMode::VerifyFull);
+}
+
+#[test]
+fn a_verifying_mode_without_a_root_certificate_is_refused() {
+    let config = NodeConfig::parse(&server_tls("verify-ca", None)).unwrap();
+
+    let err = config.server_tls().unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+    assert!(
+        err.to_string().contains("node.server_tls.root_cert"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_root_certificate_a_mode_would_never_read_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ca.crt");
+    std::fs::write(&root, "").unwrap();
+    let config = NodeConfig::parse(&server_tls("prefer", Some(&root))).unwrap();
+
+    let err = config.server_tls().unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+    assert!(
+        err.to_string().contains("node.server_tls.root_cert"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_root_certificate_that_cannot_be_read_names_the_key_it_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("missing.crt");
+    let config = NodeConfig::parse(&server_tls("verify-full", Some(&root))).unwrap();
+
+    let err = config.server_tls().unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+    assert!(
+        err.to_string().contains("node.server_tls.root_cert"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_mode_postgresql_does_not_have_is_refused() {
+    let err = NodeConfig::parse(&server_tls("verify", None)).unwrap_err();
+
+    assert!(matches!(err, ConfigError::Syntax(_)), "{err}");
+}
+
+fn server_tls(mode: &str, root: Option<&std::path::Path>) -> String {
+    let root = root.map_or_else(String::new, |path| {
+        format!("root_cert = \"{}\"\n", path.display())
+    });
+    format!("{NODE_LOCAL}\n[node.server_tls]\nmode = \"{mode}\"\n{root}")
 }

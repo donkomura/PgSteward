@@ -1,7 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use pgsteward_core::rt::turmoil_rt::TurmoilRuntime;
-use pgsteward_core::server::{ApplicationName, ServerCredentials, SimpleQuery, connect};
+use pgsteward_core::server::{
+    ApplicationName, ConnectError, ServerCredentials, SimpleQuery, connect,
+};
+use pgsteward_core::tls::{ServerTls, SslMode};
 use pgsteward_harness::fake_postgres::{FakePostgres, FakePostgresStats};
 
 const IDENTIFIER: &str = "fake-postgres";
@@ -100,4 +103,61 @@ fn every_server_connection_reports_its_own_backend() {
         backends[0], backends[1],
         "two server connections must not report the same backend: {backends:?}"
     );
+}
+
+#[test]
+fn the_fake_postgres_refuses_encryption_and_answers_the_startup_packet_after_it() {
+    let stats = FakePostgresStats::default();
+    let mut sim = turmoil::Builder::new().build();
+    start_db(&mut sim, stats.clone());
+
+    sim.client("app", async move {
+        let rt = TurmoilRuntime::new();
+        let tls = ServerTls::new(SslMode::Prefer, None).unwrap();
+        let server = connect(
+            &rt,
+            "db:5432",
+            &credentials(),
+            &ApplicationName::new(IDENTIFIER),
+            &tls,
+        )
+        .await?;
+        assert!(
+            server.parameter("server_version").is_some(),
+            "the startup goes on in the clear after the refusal"
+        );
+        Ok(())
+    });
+
+    sim.run().unwrap();
+
+    assert_eq!(stats.accepted(), 1);
+}
+
+#[test]
+fn a_connection_that_demands_encryption_does_not_reach_the_fake_postgres_startup() {
+    let stats = FakePostgresStats::default();
+    let mut sim = turmoil::Builder::new().build();
+    start_db(&mut sim, stats.clone());
+
+    sim.client("app", async move {
+        let rt = TurmoilRuntime::new();
+        let tls = ServerTls::new(SslMode::Require, None).unwrap();
+        let error = connect(
+            &rt,
+            "db:5432",
+            &credentials(),
+            &ApplicationName::new(IDENTIFIER),
+            &tls,
+        )
+        .await
+        .expect_err("the fake PostgreSQL does not encrypt");
+        assert!(
+            matches!(error, ConnectError::EncryptionRefused),
+            "expected the refusal to be reported, got {error}"
+        );
+        Ok(())
+    });
+
+    sim.run().unwrap();
 }
