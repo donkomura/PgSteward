@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use pgsteward_core::allocation::InstanceId;
 use pgsteward_core::auth::TrustAll;
+use pgsteward_core::cancel::{CancelRegistry, ProxyTag};
 use pgsteward_core::pool::{InstanceOpener, Pool, PoolLimits};
 use pgsteward_core::relay::{Welcome, transaction_mode};
 use pgsteward_core::rt::tokio_rt::TokioRuntime;
@@ -45,15 +47,21 @@ async fn start_proxy(
         },
     );
     let welcome = Welcome::default();
+    let cancels = CancelRegistry::new(ProxyTag::new(1).unwrap());
+    let instance = InstanceId::new("postgres");
     rt.spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let pool = pool.clone();
             let welcome = welcome.clone();
+            let cancels = cancels.clone();
+            let instance = instance.clone();
             serve_rt.spawn(async move {
                 let Accepted::Session(session) = accept(stream, TrustAll).await.unwrap() else {
                     panic!("expected an authenticated session");
                 };
-                transaction_mode(session, &pool, &welcome).await.unwrap();
+                transaction_mode(session, &pool, &welcome, &cancels, &instance)
+                    .await
+                    .unwrap();
             });
         }
     });

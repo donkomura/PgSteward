@@ -9,6 +9,7 @@ use pgsteward_core::admission::ClientLimit;
 use pgsteward_core::allocation::{InstanceId, ProxyId};
 use pgsteward_core::auth::ClientCredentials;
 use pgsteward_core::budget::InstanceBudget;
+use pgsteward_core::cancel::{CancelRegistry, ProxyTag, forward_cancel};
 use pgsteward_core::convergence::ProxyPools;
 use pgsteward_core::grant::InProcessCoordinator;
 use pgsteward_core::inspect::{InspectError, count_foreign_connections, read_server_limits};
@@ -22,6 +23,7 @@ use pgsteward_core::server::{
 use pgsteward_core::session::{Accepted, ClientSession};
 use pgsteward_core::tenant::TenantId;
 use pgsteward_protocol::backend::{ErrorResponse, encode_error_response, sqlstate};
+use pgsteward_protocol::startup::CancelKey;
 use pgsteward_sched::fair::WeightedMaxMinFair;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -134,8 +136,9 @@ pub async fn serve<R: Runtime>(
     }
     let monitor = node.monitor_credentials().ok_or(ServeError::NoMonitor)?;
     let policies = cluster.policies();
+    let proxy = ProxyId::new(node.node.listen.to_string());
     let coordinator = Arc::new(InProcessCoordinator::new(
-        ProxyId::new(node.node.listen.to_string()),
+        proxy.clone(),
         WeightedMaxMinFair::default(),
     ));
     coordinator.set_policies(policies.clone());
@@ -187,6 +190,7 @@ pub async fn serve<R: Runtime>(
     })?;
     let front = Front {
         rt: rt.clone(),
+        cancels: CancelRegistry::new(ProxyTag::of(&proxy)),
         limit: node.client_limit(),
         credentials: Arc::new(node.client_credentials()?),
         policies: Arc::new(policies),
@@ -311,6 +315,7 @@ impl<R: Runtime> Observer<R> {
 
 struct Front<R: Runtime> {
     rt: R,
+    cancels: CancelRegistry,
     limit: ClientLimit,
     credentials: Arc<ClientCredentials>,
     policies: Arc<Policies>,
@@ -324,6 +329,7 @@ impl<R: Runtime> Clone for Front<R> {
     fn clone(&self) -> Self {
         Self {
             rt: self.rt.clone(),
+            cancels: self.cancels.clone(),
             limit: self.limit.clone(),
             credentials: Arc::clone(&self.credentials),
             policies: Arc::clone(&self.policies),
@@ -357,8 +363,12 @@ impl<R: Runtime> Front<R> {
                 return;
             }
         };
-        let Accepted::Session(session) = accepted else {
-            return;
+        let session = match accepted {
+            Accepted::Session(session) => session,
+            Accepted::Cancel(key) => {
+                self.cancel(key).await;
+                return;
+            }
         };
         let tenant = session.tenant().clone();
         let Some(instance) = self
@@ -372,10 +382,31 @@ impl<R: Runtime> Front<R> {
         let (pool, welcome) = self
             .pools
             .checkout(&instance, &tenant, || self.open(&instance, &tenant));
-        if let Err(error) = transaction_mode(session, &pool, &welcome).await {
+        if let Err(error) =
+            transaction_mode(session, &pool, &welcome, &self.cancels, &instance).await
+        {
             tracing::warn!(%tenant, %instance, %error, "a client session ended with an error");
         }
         drop(admitted);
+    }
+
+    /// Stops what the client that carries `key` is running, if it is running
+    /// anything right now.
+    ///
+    /// A key this node did not issue, and one whose client is between requests,
+    /// are both dropped without a reply: a `CancelRequest` is unauthenticated,
+    /// and the protocol gives it no answer either way.
+    async fn cancel(&self, key: CancelKey) {
+        let Some(target) = self.cancels.target(key) else {
+            tracing::debug!("dropped a cancel request that names nothing this node is running");
+            return;
+        };
+        let Some(address) = self.addresses.get(target.instance()) else {
+            return;
+        };
+        if let Err(error) = forward_cancel(&self.rt, address, target.backend()).await {
+            tracing::warn!(instance = %target.instance(), %error, "cannot forward a cancel request");
+        }
     }
 
     fn open(&self, instance: &InstanceId, tenant: &TenantId) -> Pool<InstanceOpener<R>, R> {

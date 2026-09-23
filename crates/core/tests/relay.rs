@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
+use pgsteward_core::allocation::InstanceId;
 use pgsteward_core::auth::TrustAll;
+use pgsteward_core::cancel::{CancelRegistry, ProxyTag};
 use pgsteward_core::pool::{OpenServer, Pool, PoolLimits};
 use pgsteward_core::relay::{
     Boundary, RelayError, Welcome, serve_assignment, session_mode, transaction_mode,
@@ -1040,12 +1042,21 @@ fn pool_of(backends: Backends, slots: usize) -> Pool<Backends, TokioRuntime> {
     )
 }
 
+fn cancels() -> CancelRegistry {
+    CancelRegistry::new(ProxyTag::new(9).unwrap())
+}
+
+fn shop() -> InstanceId {
+    InstanceId::new("shop")
+}
+
 fn spawn_transaction_mode(
     session: ClientSession<DuplexStream>,
     pool: Pool<Backends, TokioRuntime>,
     welcome: Welcome,
+    cancels: CancelRegistry,
 ) -> JoinHandle<Result<(), RelayError>> {
-    tokio::spawn(async move { transaction_mode(session, &pool, &welcome).await })
+    tokio::spawn(async move { transaction_mode(session, &pool, &welcome, &cancels, &shop()).await })
 }
 
 async fn wait_until(what: &str, mut reached: impl FnMut() -> bool) {
@@ -1065,7 +1076,7 @@ async fn a_client_that_leaves_while_it_waits_for_a_slot_gives_up_its_place() {
     let welcome = Welcome::default();
 
     let (mut holder, session) = client_session(&[]).await;
-    let holding = spawn_transaction_mode(session, pool.clone(), welcome.clone());
+    let holding = spawn_transaction_mode(session, pool.clone(), welcome.clone(), cancels());
     holder.read_greeting().await;
     let mut backend = backends.accept().await;
     holder.send(&query_frame("BEGIN")).await;
@@ -1075,7 +1086,7 @@ async fn a_client_that_leaves_while_it_waits_for_a_slot_gives_up_its_place() {
     expect_ready(&mut holder, b'T').await;
 
     let (mut leaving, session) = client_session(&[]).await;
-    let waiting = spawn_transaction_mode(session, pool.clone(), welcome.clone());
+    let waiting = spawn_transaction_mode(session, pool.clone(), welcome.clone(), cancels());
     leaving.read_greeting().await;
     leaving.send(&query_frame("SELECT 1")).await;
     wait_until("the second client never reached the queue", || {
@@ -1104,4 +1115,104 @@ async fn a_client_that_leaves_while_it_waits_for_a_slot_gives_up_its_place() {
 
     drop(holder);
     holding.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn the_key_in_the_greeting_is_issued_by_this_node_and_not_by_the_backend() {
+    let backends = Backends::new();
+    let pool = pool_of(backends.clone(), 1);
+    let registry = cancels();
+
+    let (mut client, session) = client_session(&[]).await;
+    let served = spawn_transaction_mode(session, pool, Welcome::default(), registry.clone());
+    let (_parameters, key) = client.read_greeting().await;
+
+    assert_eq!(ProxyTag::in_key(key), ProxyTag::new(9).unwrap());
+    assert_ne!(
+        key, BACKEND_KEY,
+        "the backend's own key never reaches a client"
+    );
+    assert!(
+        registry.target(key).is_none(),
+        "a client that has asked for nothing cancels nothing"
+    );
+
+    drop(client);
+    served.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_cancel_request_names_the_backend_that_is_running_the_query() {
+    let backends = Backends::new();
+    let pool = pool_of(backends.clone(), 1);
+    let registry = cancels();
+
+    let (mut client, session) = client_session(&[]).await;
+    let served = spawn_transaction_mode(session, pool, Welcome::default(), registry.clone());
+    let (_parameters, key) = client.read_greeting().await;
+    client.send(&query_frame("SELECT pg_sleep(30)")).await;
+    let mut backend = backends.accept().await;
+    expect_query(&mut backend, "SELECT pg_sleep(30)").await;
+
+    wait_until("the cancel key never named a backend", || {
+        registry.target(key).is_some()
+    })
+    .await;
+    let target = registry.target(key).unwrap();
+
+    assert_eq!(target.instance(), &shop());
+    assert_eq!(target.backend(), BACKEND_KEY);
+
+    backend.send(&command_complete("SELECT 1", b'I')).await;
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+    expect_query(&mut backend, "DISCARD ALL").await;
+    backend.send(&command_complete("DISCARD ALL", b'I')).await;
+    drop(client);
+    served.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_cancel_request_that_arrives_after_the_query_finished_has_no_target() {
+    let backends = Backends::new();
+    let pool = pool_of(backends.clone(), 1);
+    let registry = cancels();
+
+    let (mut client, session) = client_session(&[]).await;
+    let served = spawn_transaction_mode(session, pool, Welcome::default(), registry.clone());
+    let (_parameters, key) = client.read_greeting().await;
+    client.send(&query_frame("SELECT 1")).await;
+    let mut backend = backends.accept().await;
+    expect_query(&mut backend, "SELECT 1").await;
+    backend.send(&command_complete("SELECT 1", b'I')).await;
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+
+    wait_until("a late cancel request still named a backend", || {
+        registry.target(key).is_none()
+    })
+    .await;
+
+    expect_query(&mut backend, "DISCARD ALL").await;
+    backend.send(&command_complete("DISCARD ALL", b'I')).await;
+    drop(client);
+    served.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn the_cancel_key_is_forgotten_when_the_client_leaves() {
+    let backends = Backends::new();
+    let pool = pool_of(backends.clone(), 1);
+    let registry = cancels();
+
+    let (mut client, session) = client_session(&[]).await;
+    let served = spawn_transaction_mode(session, pool, Welcome::default(), registry.clone());
+    let (_parameters, key) = client.read_greeting().await;
+    assert_eq!(registry.len(), 1);
+
+    client.send(&terminate_frame()).await;
+    served.await.unwrap().unwrap();
+
+    assert!(registry.target(key).is_none());
+    assert!(registry.is_empty());
 }
