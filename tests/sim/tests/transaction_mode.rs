@@ -73,7 +73,7 @@ fn start_proxy(sim: &mut turmoil::Sim<'_>, slots: usize, wait_timeout: Duration)
             let cancels = cancels.clone();
             let instance = instance.clone();
             rt.spawn(async move {
-                let Ok(Accepted::Session(session)) = accept(stream, TrustAll).await else {
+                let Ok(Accepted::Session(session)) = accept(stream, TrustAll, None).await else {
                     return;
                 };
                 let _ = transaction_mode(session, &pool, &welcome, &cancels, &instance).await;

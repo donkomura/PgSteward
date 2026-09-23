@@ -34,15 +34,18 @@ humantime-serde = "1.1"
 postgres-protocol = "0.6"
 proptest = "1.6"
 rand = "0.10"
+rcgen = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.11"
 stringprep = "0.1"
 subtle = "2.6"
+tempfile = "3.24"
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync", "signal"] }
 tokio-postgres = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 toml = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

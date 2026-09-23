@@ -22,6 +22,7 @@ use pgsteward_core::server::{
 };
 use pgsteward_core::session::{Accepted, ClientSession};
 use pgsteward_core::tenant::TenantId;
+use pgsteward_core::tls::ClientTls;
 use pgsteward_protocol::backend::{ErrorResponse, encode_error_response, sqlstate};
 use pgsteward_protocol::startup::CancelKey;
 use pgsteward_sched::fair::WeightedMaxMinFair;
@@ -193,6 +194,7 @@ pub async fn serve<R: Runtime>(
         cancels: CancelRegistry::new(ProxyTag::of(&proxy)),
         limit: node.client_limit(),
         credentials: Arc::new(node.client_credentials()?),
+        tls: node.client_tls()?.map(Arc::new),
         policies: Arc::new(policies),
         addresses: Arc::new(addresses),
         node: Arc::new(node),
@@ -318,6 +320,7 @@ struct Front<R: Runtime> {
     cancels: CancelRegistry,
     limit: ClientLimit,
     credentials: Arc<ClientCredentials>,
+    tls: Option<Arc<ClientTls>>,
     policies: Arc<Policies>,
     addresses: Arc<BTreeMap<InstanceId, String>>,
     node: Arc<NodeConfig>,
@@ -332,6 +335,7 @@ impl<R: Runtime> Clone for Front<R> {
             cancels: self.cancels.clone(),
             limit: self.limit.clone(),
             credentials: Arc::clone(&self.credentials),
+            tls: self.tls.clone(),
             policies: Arc::clone(&self.policies),
             addresses: Arc::clone(&self.addresses),
             node: Arc::clone(&self.node),
@@ -355,7 +359,10 @@ impl<R: Runtime> Front<R> {
     }
 
     async fn serve_client(self, stream: R::Stream) {
-        let (admitted, accepted) = match self.limit.accept(stream, self.credentials.as_ref()).await
+        let (admitted, accepted) = match self
+            .limit
+            .accept(stream, self.credentials.as_ref(), self.tls.as_deref())
+            .await
         {
             Ok(accepted) => accepted,
             Err(error) => {

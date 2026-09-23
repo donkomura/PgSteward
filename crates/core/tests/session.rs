@@ -4,6 +4,7 @@ use pgsteward_core::auth::{AuthMethod, Credentials, TrustAll};
 use pgsteward_core::scram::{DEFAULT_ITERATIONS, ScramVerifier};
 use pgsteward_core::session::{AcceptError, Accepted, ClientSession, accept};
 use pgsteward_core::tenant::TenantId;
+use pgsteward_core::tls::MaybeTls;
 use pgsteward_protocol::backend::sqlstate;
 use pgsteward_protocol::framing::{Frame, decode_frame, encode_frame};
 use pgsteward_protocol::startup::{
@@ -193,10 +194,10 @@ fn query_frame(sql: &str) -> Vec<u8> {
 
 async fn accepted_session(
     client_steps: impl AsyncFnOnce(&mut Client),
-) -> ClientSession<DuplexStream> {
+) -> ClientSession<MaybeTls<DuplexStream>> {
     let (client_stream, session_stream) = duplex(DUPLEX_CAPACITY);
     let mut client = Client::new(client_stream);
-    let session = tokio::spawn(accept(session_stream, TrustAll));
+    let session = tokio::spawn(accept(session_stream, TrustAll, None));
     client_steps(&mut client).await;
     let accepted = session.await.unwrap().unwrap();
     let Accepted::Session(session) = accepted else {
@@ -209,10 +210,10 @@ async fn accepted_session(
 async fn authenticated_session(
     credentials: impl Credentials + Send + 'static,
     client_steps: impl AsyncFnOnce(&mut Client),
-) -> ClientSession<DuplexStream> {
+) -> ClientSession<MaybeTls<DuplexStream>> {
     let (client_stream, session_stream) = duplex(DUPLEX_CAPACITY);
     let mut client = Client::new(client_stream);
-    let session = tokio::spawn(accept(session_stream, credentials));
+    let session = tokio::spawn(accept(session_stream, credentials, None));
     client_steps(&mut client).await;
     let accepted = session.await.unwrap().unwrap();
     let Accepted::Session(session) = accepted else {
@@ -227,7 +228,7 @@ async fn refused_by(
 ) -> (AcceptError, Vec<(u8, String)>) {
     let (client_stream, session_stream) = duplex(DUPLEX_CAPACITY);
     let mut client = Client::new(client_stream);
-    let session = tokio::spawn(accept(session_stream, credentials));
+    let session = tokio::spawn(accept(session_stream, credentials, None));
     client_steps(&mut client).await;
     let error = session.await.unwrap().expect_err("the client is refused");
     let fields = client.read_error().await;
@@ -305,7 +306,7 @@ async fn a_cancel_request_is_returned_without_resolving_a_tenant() {
     };
     client.send_startup(&StartupRequest::Cancel(key)).await;
 
-    let accepted = accept(session_stream, TrustAll).await.unwrap();
+    let accepted = accept(session_stream, TrustAll, None).await.unwrap();
     assert!(matches!(accepted, Accepted::Cancel(returned) if returned == key));
 }
 
@@ -379,7 +380,7 @@ async fn a_client_that_closes_before_the_startup_packet_is_not_an_error_response
     let (client_stream, session_stream) = duplex(DUPLEX_CAPACITY);
     drop(client_stream);
 
-    let error = accept(session_stream, TrustAll)
+    let error = accept(session_stream, TrustAll, None)
         .await
         .expect_err("no startup packet");
     assert!(matches!(error, AcceptError::ConnectionClosed), "{error:?}");
@@ -478,7 +479,11 @@ async fn a_query_sent_where_a_sasl_response_belongs_is_a_protocol_violation() {
 async fn a_client_that_closes_during_authentication_is_not_an_error_response() {
     let (client_stream, session_stream) = duplex(DUPLEX_CAPACITY);
     let mut client = Client::new(client_stream);
-    let session = tokio::spawn(accept(session_stream, OneUser::new("app_web", "secret")));
+    let session = tokio::spawn(accept(
+        session_stream,
+        OneUser::new("app_web", "secret"),
+        None,
+    ));
     client.send_startup(&startup(&[("user", "app_web")])).await;
     assert_eq!(
         client.read_offered_mechanisms().await,

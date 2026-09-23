@@ -13,6 +13,7 @@ use pgsteward_core::relay::{
 use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::server::{ApplicationName, ConnectError, ServerConnection, ServerCredentials};
 use pgsteward_core::session::{Accepted, ClientSession, accept};
+use pgsteward_core::tls::MaybeTls;
 use pgsteward_protocol::framing::{Frame, decode_frame, decode_startup_frame, encode_frame};
 use pgsteward_protocol::startup::{
     CancelKey, ProtocolVersion, StartupMessage, StartupRequest, decode_startup, encode_startup,
@@ -245,10 +246,10 @@ fn error_fields(body: &ErrorResponseBody) -> Vec<(u8, String)> {
     collected
 }
 
-async fn client_session(pipelined: &[u8]) -> (Client, ClientSession<DuplexStream>) {
+async fn client_session(pipelined: &[u8]) -> (Client, ClientSession<MaybeTls<DuplexStream>>) {
     let (client_stream, session_stream) = duplex(DUPLEX_CAPACITY);
     let mut client = Client::new(client_stream);
-    let accepting = tokio::spawn(accept(session_stream, TrustAll));
+    let accepting = tokio::spawn(accept(session_stream, TrustAll, None));
 
     let mut out = BytesMut::new();
     encode_startup(
@@ -1051,7 +1052,7 @@ fn shop() -> InstanceId {
 }
 
 fn spawn_transaction_mode(
-    session: ClientSession<DuplexStream>,
+    session: ClientSession<MaybeTls<DuplexStream>>,
     pool: Pool<Backends, TokioRuntime>,
     welcome: Welcome,
     cancels: CancelRegistry,

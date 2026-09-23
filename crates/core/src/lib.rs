@@ -14,3 +14,4 @@ pub mod scram;
 pub mod server;
 pub mod session;
 pub mod tenant;
+pub mod tls;

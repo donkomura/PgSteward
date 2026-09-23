@@ -5,6 +5,7 @@ use pgsteward_core::auth::{AuthMethod, Credentials, TrustAll};
 use pgsteward_core::scram::{DEFAULT_ITERATIONS, ScramVerifier};
 use pgsteward_core::session::{AcceptError, Accepted};
 use pgsteward_core::tenant::TenantId;
+use pgsteward_core::tls::MaybeTls;
 use pgsteward_protocol::framing::{decode_frame, encode_frame};
 use pgsteward_protocol::startup::{
     ProtocolVersion, StartupMessage, StartupRequest, encode_startup,
@@ -76,8 +77,8 @@ impl Client {
 async fn admit(
     limit: &ClientLimit,
     proxy: DuplexStream,
-) -> Result<(Admitted, Accepted<DuplexStream>), AcceptError> {
-    limit.accept(proxy, TrustAll).await
+) -> Result<(Admitted, Accepted<MaybeTls<DuplexStream>>), AcceptError> {
+    limit.accept(proxy, TrustAll, None).await
 }
 
 #[tokio::test]
@@ -131,7 +132,7 @@ async fn a_client_over_the_limit_is_refused_without_being_authenticated() {
 
     let (mut client, proxy) = Client::arrive("app_web").await;
     let error = limit
-        .accept(proxy, OneVerifier::for_user("app_web", "secret"))
+        .accept(proxy, OneVerifier::for_user("app_web", "secret"), None)
         .await
         .unwrap_err();
     assert!(matches!(error, AcceptError::TooManyClients { max: 1 }));

@@ -18,6 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::auth::{AuthMethod, Credentials};
 use crate::scram::{MECHANISM, ScramError, ScramExchange, ScramVerifier, nonce};
 use crate::tenant::{TenantId, TenantResolveError};
+use crate::tls::{ClientTls, MaybeTls};
 
 const MAX_STARTUP_PACKET: usize = 10_000;
 const MAX_AUTH_MESSAGE: usize = 10_000;
@@ -52,6 +53,8 @@ pub enum AcceptError {
     Tenant(TenantResolveError),
     #[error("the client asked for {0} encryption twice")]
     RepeatedEncryptionRequest(Encryption),
+    #[error("the client sent unencrypted data after this node answered its TLS request")]
+    UnencryptedData,
     #[error("malformed SASL message: {0}")]
     Frontend(#[from] FrontendError),
     #[error("the client asked for the {0:?} SASL mechanism; this node offers {MECHANISM}")]
@@ -69,7 +72,7 @@ pub enum AcceptError {
 impl AcceptError {
     fn response(&self) -> Option<ErrorResponse> {
         match self {
-            Self::Io(_) | Self::ConnectionClosed => None,
+            Self::Io(_) | Self::ConnectionClosed | Self::UnencryptedData => None,
             Self::Startup(StartupError::UnsupportedProtocolVersion(version)) => {
                 Some(ErrorResponse::fatal(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -147,9 +150,11 @@ impl<S> ClientSession<S> {
 }
 
 pub async fn accept<S: AsyncRead + AsyncWrite + Unpin, C: Credentials>(
-    mut stream: S,
+    stream: S,
     credentials: C,
-) -> Result<Accepted<S>, AcceptError> {
+    tls: Option<&ClientTls>,
+) -> Result<Accepted<MaybeTls<S>>, AcceptError> {
+    let mut stream = MaybeTls::Plain(stream);
     let mut pending = BytesMut::with_capacity(READ_CHUNK);
     let mut asked = Negotiation::default();
     loop {
@@ -185,10 +190,24 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin, C: Credentials>(
             let error = AcceptError::RepeatedEncryptionRequest(encryption);
             return Err(refuse(&mut stream, error).await);
         }
-        write(&mut stream, |out| {
-            encode_encryption_response(EncryptionResponse::Refused, out);
-        })
-        .await?;
+        match tls.filter(|_| encryption == Encryption::Tls) {
+            Some(tls) => {
+                write(&mut stream, |out| {
+                    encode_encryption_response(EncryptionResponse::Accepted, out);
+                })
+                .await?;
+                if !pending.is_empty() {
+                    return Err(AcceptError::UnencryptedData);
+                }
+                stream = stream.encrypt(tls).await?;
+            }
+            None => {
+                write(&mut stream, |out| {
+                    encode_encryption_response(EncryptionResponse::Refused, out);
+                })
+                .await?;
+            }
+        }
     }
 }
 

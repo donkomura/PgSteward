@@ -124,7 +124,8 @@ fn start_proxy_with_limit<C: Credentials + Clone + Send + 'static>(
                 let credentials = credentials.clone();
                 let limit = limit.clone();
                 rt.spawn(async move {
-                    let Ok((_admitted, accepted)) = limit.accept(stream, credentials).await else {
+                    let Ok((_admitted, accepted)) = limit.accept(stream, credentials, None).await
+                    else {
                         return;
                     };
                     if let Accepted::Session(session) = accepted {
