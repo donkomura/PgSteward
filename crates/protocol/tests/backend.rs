@@ -1,14 +1,19 @@
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use pgsteward_protocol::backend::{
-    EncryptionResponse, ErrorResponse, Severity, encode_authentication_ok,
+    Column, EncryptionResponse, ErrorResponse, Severity, encode_authentication_ok,
     encode_authentication_sasl, encode_authentication_sasl_continue,
-    encode_authentication_sasl_final, encode_backend_key_data, encode_encryption_response,
-    encode_error_response, encode_parameter_status, encode_ready_for_query, sqlstate,
+    encode_authentication_sasl_final, encode_backend_key_data, encode_command_complete,
+    encode_data_row, encode_empty_query_response, encode_encryption_response,
+    encode_error_response, encode_parameter_status, encode_ready_for_query,
+    encode_row_description, sqlstate,
 };
 use pgsteward_protocol::message::TransactionStatus;
 use pgsteward_protocol::startup::CancelKey;
 use postgres_protocol::message::backend::{ErrorResponseBody, Message};
+
+const TEXT_OID: u32 = 25;
+const INT8_OID: u32 = 20;
 
 fn encoded(encode: impl FnOnce(&mut BytesMut)) -> BytesMut {
     let mut out = BytesMut::new();
@@ -199,4 +204,96 @@ fn ready_for_query_carries_the_transaction_status() {
         };
         assert_eq!(body.status(), byte);
     }
+}
+
+#[test]
+fn a_row_description_names_every_column_and_asks_for_the_text_format() {
+    let columns = [
+        Column::text("database"),
+        Column::count("granted"),
+        Column::count("actual"),
+    ];
+    let message = parse(encoded(|out| encode_row_description(&columns, out)));
+    let Message::RowDescription(body) = message else {
+        panic!("expected a RowDescription");
+    };
+    let described: Vec<(String, u32, i16, i16)> = body
+        .fields()
+        .map(|field| {
+            Ok((
+                field.name().to_owned(),
+                field.type_oid(),
+                field.type_size(),
+                field.format(),
+            ))
+        })
+        .collect()
+        .expect("well-formed column descriptions");
+    assert_eq!(
+        described,
+        vec![
+            ("database".to_owned(), TEXT_OID, -1, 0),
+            ("granted".to_owned(), INT8_OID, 8, 0),
+            ("actual".to_owned(), INT8_OID, 8, 0),
+        ]
+    );
+}
+
+#[test]
+fn a_row_description_leaves_the_columns_without_a_table_of_their_own() {
+    let message = parse(encoded(|out| {
+        encode_row_description(&[Column::text("database")], out);
+    }));
+    let Message::RowDescription(body) = message else {
+        panic!("expected a RowDescription");
+    };
+    let field = body
+        .fields()
+        .next()
+        .expect("well-formed column descriptions")
+        .expect("one column");
+    assert_eq!(field.table_oid(), 0);
+    assert_eq!(field.column_id(), 0);
+    assert_eq!(field.type_modifier(), -1);
+}
+
+#[test]
+fn a_data_row_carries_the_values_in_the_order_the_columns_were_described() {
+    let message = parse(encoded(|out| {
+        encode_data_row(&[Some("app_web"), Some("30"), None], out);
+    }));
+    let Message::DataRow(body) = message else {
+        panic!("expected a DataRow");
+    };
+    let buffer = body.buffer().to_vec();
+    let values: Vec<Option<String>> = body
+        .ranges()
+        .map(|range| {
+            Ok(range.map(|range| {
+                String::from_utf8(buffer[range].to_vec()).expect("a UTF-8 text value")
+            }))
+        })
+        .collect()
+        .expect("well-formed value ranges");
+    assert_eq!(
+        values,
+        vec![Some("app_web".to_owned()), Some("30".to_owned()), None]
+    );
+}
+
+#[test]
+fn a_command_complete_carries_the_tag() {
+    for tag in ["SHOW", "RELOAD", "PAUSE"] {
+        let message = parse(encoded(|out| encode_command_complete(tag, out)));
+        let Message::CommandComplete(body) = message else {
+            panic!("expected a CommandComplete");
+        };
+        assert_eq!(body.tag().expect("a UTF-8 tag"), tag);
+    }
+}
+
+#[test]
+fn an_empty_query_response_stands_in_for_a_text_that_held_no_statement() {
+    let message = parse(encoded(encode_empty_query_response));
+    assert!(matches!(message, Message::EmptyQueryResponse));
 }
