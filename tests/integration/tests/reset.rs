@@ -10,6 +10,7 @@ use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::rt::{Net, Spawner};
 use pgsteward_core::server::{ApplicationName, ServerCredentials};
 use pgsteward_core::session::{Accepted, accept};
+use pgsteward_harness::server_tls;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -61,7 +62,13 @@ async fn start_proxy(
     let addr = listener.local_addr().unwrap();
     let serve_rt = *rt;
     let pool = Pool::new(
-        InstanceOpener::new(serve_rt, server_addr, credentials(), application_name),
+        InstanceOpener::new(
+            serve_rt,
+            server_addr,
+            credentials(),
+            application_name,
+            server_tls(),
+        ),
         serve_rt,
         PoolLimits {
             slots: SLOTS,

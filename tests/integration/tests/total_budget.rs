@@ -5,6 +5,7 @@ use pgsteward_core::inspect::{count_foreign_connections, read_server_limits};
 use pgsteward_core::rt::Instant;
 use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::server::{ApplicationName, ServerCredentials, connect};
+use pgsteward_harness::server_tls;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -53,6 +54,7 @@ async fn the_total_budget_shrinks_by_the_foreign_connections_the_server_reports(
         &format!("127.0.0.1:{port}"),
         &credentials(),
         &ApplicationName::new("integration"),
+        &server_tls(),
     )
     .await
     .unwrap();

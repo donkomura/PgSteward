@@ -13,6 +13,7 @@ use pgsteward_core::server::{ApplicationName, ServerCredentials};
 use pgsteward_core::session::{Accepted, accept};
 use pgsteward_harness::cap::{CapMonitor, CapReport};
 use pgsteward_harness::fake_postgres::{FakePostgres, FakePostgresStats};
+use pgsteward_harness::server_tls;
 use pgsteward_protocol::framing::{Frame, decode_frame, encode_frame};
 use pgsteward_protocol::startup::{
     CancelKey, ProtocolVersion, StartupMessage, StartupRequest, encode_startup,
@@ -55,6 +56,7 @@ fn start_proxy(sim: &mut turmoil::Sim<'_>, slots: usize, wait_timeout: Duration)
                 "db:5432".to_owned(),
                 credentials(),
                 ApplicationName::new(IDENTIFIER),
+                server_tls(),
             ),
             rt,
             PoolLimits {

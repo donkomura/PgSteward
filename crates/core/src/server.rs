@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::pool::CloseServer;
 use crate::rt::Net;
+use crate::tls::{MaybeTls, ServerTls, SslMode};
 
 const READ_CHUNK: usize = 8 * 1024;
 const SQLSTATE_FIELD: u8 = b'C';
@@ -103,6 +104,12 @@ pub enum ConnectError {
     Unreachable(io::Error),
     #[error(transparent)]
     Handshake(#[from] HandshakeError),
+    #[error("the server does not encrypt, and this node is configured to demand it")]
+    EncryptionRefused,
+    #[error("the server answered the encryption request with `{}`, which is neither S nor N", *.0 as char)]
+    EncryptionAnswer(u8),
+    #[error("cannot encrypt the connection to the server: {0}")]
+    Encryption(io::Error),
 }
 
 pub type Row = Vec<Option<String>>;
@@ -127,11 +134,63 @@ pub async fn connect<N: Net>(
     addr: &str,
     credentials: &ServerCredentials,
     application_name: &ApplicationName,
-) -> Result<ServerConnection<N::Stream>, ConnectError> {
+    tls: &ServerTls,
+) -> Result<ServerConnection<MaybeTls<N::Stream>>, ConnectError> {
     let stream = net.connect(addr).await.map_err(|source| {
         ConnectError::Unreachable(io::Error::new(source.kind(), format!("{addr}: {source}")))
     })?;
+    let stream = request_encryption(stream, tls, host_of(addr)).await?;
     Ok(ServerConnection::handshake(stream, credentials, application_name).await?)
+}
+
+/// The `SSLRequest` exchange, which comes before the startup packet: one packet
+/// out and one byte back, `S` to encrypt and `N` to carry on in the clear.
+pub async fn request_encryption<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    tls: &ServerTls,
+    host: &str,
+) -> Result<MaybeTls<S>, ConnectError> {
+    if tls.mode() == SslMode::Disable {
+        return Ok(MaybeTls::Plain(stream));
+    }
+    let mut out = BytesMut::new();
+    encode_startup(&StartupRequest::Ssl, &mut out);
+    write_all(&mut stream, &out).await?;
+
+    let mut answer = [0u8; 1];
+    stream
+        .read_exact(&mut answer)
+        .await
+        .map_err(HandshakeError::Io)?;
+    match answer[0] {
+        b'S' => tls
+            .encrypt(stream, host)
+            .await
+            .map_err(ConnectError::Encryption),
+        b'N' if tls.mode().demands_encryption() => Err(ConnectError::EncryptionRefused),
+        b'N' => Ok(MaybeTls::Plain(stream)),
+        other => Err(ConnectError::EncryptionAnswer(other)),
+    }
+}
+
+async fn write_all<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    out: &[u8],
+) -> Result<(), HandshakeError> {
+    stream.write_all(out).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// The host of `host:port`, which is the name a certificate is checked against.
+fn host_of(addr: &str) -> &str {
+    if let Some(host) = addr.strip_prefix('[') {
+        return host.split_once(']').map_or(addr, |(host, _)| host);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => host,
+        _ => addr,
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {

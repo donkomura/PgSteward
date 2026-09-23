@@ -115,12 +115,20 @@ impl FakePostgres {
 
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, backend: i32) -> io::Result<()> {
     let mut buf = BytesMut::new();
-    let Some(body) = read_startup(&mut stream, &mut buf).await? else {
-        return Ok(());
-    };
-    let Ok(StartupRequest::Startup(_)) = decode_startup(&body) else {
-        return Ok(());
-    };
+    loop {
+        let Some(body) = read_startup(&mut stream, &mut buf).await? else {
+            return Ok(());
+        };
+        match decode_startup(&body) {
+            Ok(StartupRequest::Startup(_)) => break,
+            // The fake PostgreSQL holds no certificate, so it answers every
+            // encryption request the way a server built without TLS does.
+            Ok(StartupRequest::Ssl | StartupRequest::GssEnc) => {
+                write(&mut stream, b"N").await?;
+            }
+            _ => return Ok(()),
+        }
+    }
     write(&mut stream, &greeting(backend)).await?;
 
     let mut status = TransactionStatus::Idle;

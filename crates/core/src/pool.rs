@@ -11,6 +11,7 @@ use crate::rt::{Clock, Net};
 use crate::server::{
     ApplicationName, ConnectError, ServerConnection, ServerCredentials, SimpleQuery, connect,
 };
+use crate::tls::{MaybeTls, ServerTls};
 
 /// The statement that takes a server connection back to the state it had
 /// when it was opened: `SET`, prepared statements, temporary tables and
@@ -39,6 +40,7 @@ pub struct InstanceOpener<N> {
     addr: String,
     credentials: ServerCredentials,
     application_name: ApplicationName,
+    tls: Arc<ServerTls>,
 }
 
 impl<N: Net> InstanceOpener<N> {
@@ -48,18 +50,20 @@ impl<N: Net> InstanceOpener<N> {
         addr: String,
         credentials: ServerCredentials,
         application_name: ApplicationName,
+        tls: Arc<ServerTls>,
     ) -> Self {
         Self {
             net,
             addr,
             credentials,
             application_name,
+            tls,
         }
     }
 }
 
 impl<N: Net> OpenServer for InstanceOpener<N> {
-    type Connection = ServerConnection<N::Stream>;
+    type Connection = ServerConnection<MaybeTls<N::Stream>>;
 
     fn open(&self) -> impl Future<Output = Result<Self::Connection, ConnectError>> + Send {
         connect(
@@ -67,6 +71,7 @@ impl<N: Net> OpenServer for InstanceOpener<N> {
             &self.addr,
             &self.credentials,
             &self.application_name,
+            &self.tls,
         )
     }
 }

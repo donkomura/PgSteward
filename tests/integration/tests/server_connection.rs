@@ -4,6 +4,7 @@ use pgsteward_core::rt::tokio_rt::TokioRuntime;
 use pgsteward_core::server::{
     ApplicationName, ConnectError, HandshakeError, ServerCredentials, connect,
 };
+use pgsteward_harness::server_tls;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -75,6 +76,7 @@ async fn handshake_with_trust_auth_tags_the_connection_and_keeps_the_startup_par
         &format!("127.0.0.1:{port}"),
         &credentials("postgres"),
         &ApplicationName::new("integration"),
+        &server_tls(),
     )
     .await
     .unwrap();
@@ -107,6 +109,7 @@ async fn unknown_database_is_refused_with_the_server_sqlstate() {
         &format!("127.0.0.1:{port}"),
         &credentials("no_such_database"),
         &ApplicationName::new("integration"),
+        &server_tls(),
     )
     .await
     .unwrap_err();
@@ -131,6 +134,7 @@ async fn handshake_authenticates_with_scram_sha_256() {
         &format!("127.0.0.1:{port}"),
         &credentials_with_password("postgres", "postgres"),
         &ApplicationName::new("scram"),
+        &server_tls(),
     )
     .await
     .unwrap();
@@ -152,6 +156,7 @@ async fn a_wrong_password_is_refused_with_the_server_sqlstate() {
         &format!("127.0.0.1:{port}"),
         &credentials_with_password("postgres", "not-the-password"),
         &ApplicationName::new("scram"),
+        &server_tls(),
     )
     .await
     .unwrap_err();

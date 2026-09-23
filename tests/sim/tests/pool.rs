@@ -7,6 +7,7 @@ use pgsteward_core::rt::{Clock, Spawner, turmoil_rt::TurmoilRuntime};
 use pgsteward_core::server::{ApplicationName, ServerCredentials, SimpleQuery};
 use pgsteward_harness::cap::{CapMonitor, CapReport};
 use pgsteward_harness::fake_postgres::{FakePostgres, FakePostgresStats};
+use pgsteward_harness::server_tls;
 
 const IDENTIFIER: &str = "sim-pool";
 const SLOTS: usize = 2;
@@ -44,6 +45,7 @@ fn pool(
             "db:5432".to_owned(),
             credentials(),
             ApplicationName::new(IDENTIFIER),
+            server_tls(),
         ),
         rt,
         limits,

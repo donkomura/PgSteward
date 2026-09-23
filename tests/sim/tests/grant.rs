@@ -12,6 +12,7 @@ use pgsteward_core::server::{ApplicationName, ServerCredentials, SimpleQuery};
 use pgsteward_core::tenant::TenantId;
 use pgsteward_harness::cap::{CapMonitor, CapReport};
 use pgsteward_harness::fake_postgres::{FakePostgres, FakePostgresStats};
+use pgsteward_harness::server_tls;
 use pgsteward_sched::fair::WeightedMaxMinFair;
 
 const IDENTIFIER: &str = "sim-grant";
@@ -54,6 +55,7 @@ fn pool(rt: TurmoilRuntime) -> Pool<InstanceOpener<TurmoilRuntime>, TurmoilRunti
                 password: None,
             },
             ApplicationName::new(IDENTIFIER),
+            server_tls(),
         ),
         rt,
         PoolLimits {
