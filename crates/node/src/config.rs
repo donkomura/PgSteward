@@ -281,6 +281,16 @@ pub enum PoolMode {
     Transaction,
 }
 
+impl PoolMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Transaction => "transaction",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {

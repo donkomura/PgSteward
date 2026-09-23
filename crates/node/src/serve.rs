@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::BytesMut;
 use pgsteward_core::admission::ClientLimit;
 use pgsteward_core::allocation::{InstanceId, ProxyId};
 use pgsteward_core::auth::ClientCredentials;
-use pgsteward_core::budget::InstanceBudget;
+use pgsteward_core::budget::{InstanceBudget, TotalBudget};
 use pgsteward_core::cancel::{CancelRegistry, ProxyTag, forward_cancel};
+use pgsteward_core::console::{
+    ConsoleView, InstanceSnapshot, PoolSnapshot, is_console, serve_console,
+};
 use pgsteward_core::convergence::ProxyPools;
 use pgsteward_core::grant::InProcessCoordinator;
 use pgsteward_core::inspect::{InspectError, count_foreign_connections, read_server_limits};
@@ -147,6 +150,11 @@ pub async fn serve<R: Runtime>(
 
     let mut tasks = Vec::new();
     let mut addresses = BTreeMap::new();
+    let derived = Arc::new(DerivedBudgets::default());
+    let budgets = Budgets {
+        coordinator: Arc::clone(&coordinator),
+        derived: Arc::clone(&derived),
+    };
     for instance in &cluster.instance {
         let observer = Observer::start(
             rt.clone(),
@@ -155,7 +163,7 @@ pub async fn serve<R: Runtime>(
             monitor.clone(),
             Arc::clone(&server_tls),
             options,
-            Arc::clone(&coordinator),
+            budgets.clone(),
         )
         .await?;
         tasks.push(rt.spawn(observer.run()));
@@ -193,6 +201,8 @@ pub async fn serve<R: Runtime>(
     })?;
     let front = Front {
         rt: rt.clone(),
+        proxy: proxy.clone(),
+        pool_mode: cluster.cluster.pool_mode.as_str(),
         cancels: CancelRegistry::new(ProxyTag::of(&proxy)),
         limit: node.client_limit(),
         credentials: Arc::new(node.client_credentials()?),
@@ -202,6 +212,8 @@ pub async fn serve<R: Runtime>(
         addresses: Arc::new(addresses),
         node: Arc::new(node),
         pools: Arc::clone(&pools),
+        coordinator: Arc::clone(&coordinator),
+        derived,
         wait_timeout: options.wait_timeout,
     };
     tasks.push(rt.spawn(front.accept(listener)));
@@ -227,7 +239,50 @@ struct Observer<R: Runtime> {
     interval: Duration,
     budget: InstanceBudget,
     connection: Option<ServerConnection<MaybeTls<R::Stream>>>,
+    budgets: Budgets,
+}
+
+/// Where an observer publishes the budget it derived: the coordinator
+/// allocates against the number, and the console explains that number from
+/// the parts beside it.
+#[derive(Debug, Clone)]
+struct Budgets {
     coordinator: Arc<Coordinator>,
+    derived: Arc<DerivedBudgets>,
+}
+
+impl Budgets {
+    fn publish(&self, instance: &InstanceId, budget: TotalBudget) {
+        self.coordinator
+            .set_budget(instance.clone(), budget.total());
+        self.derived.set(instance.clone(), budget);
+    }
+}
+
+/// The total budget of each instance together with the parts it was derived
+/// from. The coordinator keeps only the number it allocates against, so the
+/// breakdown the console explains it with is kept here.
+#[derive(Debug, Default)]
+struct DerivedBudgets(Mutex<BTreeMap<InstanceId, TotalBudget>>);
+
+impl DerivedBudgets {
+    fn set(&self, instance: InstanceId, budget: TotalBudget) {
+        self.lock().insert(instance, budget);
+    }
+
+    fn snapshot(&self) -> Vec<InstanceSnapshot> {
+        self.lock()
+            .iter()
+            .map(|(instance, budget)| InstanceSnapshot {
+                instance: instance.clone(),
+                budget: *budget,
+            })
+            .collect()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<InstanceId, TotalBudget>> {
+        self.0.lock().expect("derived budgets lock poisoned")
+    }
 }
 
 impl<R: Runtime> Observer<R> {
@@ -238,7 +293,7 @@ impl<R: Runtime> Observer<R> {
         credentials: ServerCredentials,
         tls: Arc<ServerTls>,
         options: ServeOptions,
-        coordinator: Arc<Coordinator>,
+        budgets: Budgets,
     ) -> Result<Self, ServeError> {
         let mut connection = connect(
             &rt,
@@ -267,7 +322,7 @@ impl<R: Runtime> Observer<R> {
         );
         budget.observe(rt.now(), foreign);
         tracing::info!(%instance, budget = %budget.current(), "derived the total budget");
-        coordinator.set_budget(instance.clone(), budget.current().total());
+        budgets.publish(&instance, budget.current());
         Ok(Self {
             rt,
             instance,
@@ -277,7 +332,7 @@ impl<R: Runtime> Observer<R> {
             interval: options.observe_interval,
             budget,
             connection: Some(connection),
-            coordinator,
+            budgets,
         })
     }
 
@@ -287,8 +342,7 @@ impl<R: Runtime> Observer<R> {
             match self.observe().await {
                 Ok(foreign) => {
                     self.budget.observe(self.rt.now(), foreign);
-                    self.coordinator
-                        .set_budget(self.instance.clone(), self.budget.current().total());
+                    self.budgets.publish(&self.instance, self.budget.current());
                 }
                 Err(error) => {
                     self.connection = None;
@@ -330,6 +384,8 @@ impl<R: Runtime> Observer<R> {
 
 struct Front<R: Runtime> {
     rt: R,
+    proxy: ProxyId,
+    pool_mode: &'static str,
     cancels: CancelRegistry,
     limit: ClientLimit,
     credentials: Arc<ClientCredentials>,
@@ -339,6 +395,8 @@ struct Front<R: Runtime> {
     addresses: Arc<BTreeMap<InstanceId, String>>,
     node: Arc<NodeConfig>,
     pools: Arc<NodePools<R>>,
+    coordinator: Arc<Coordinator>,
+    derived: Arc<DerivedBudgets>,
     wait_timeout: Duration,
 }
 
@@ -346,6 +404,8 @@ impl<R: Runtime> Clone for Front<R> {
     fn clone(&self) -> Self {
         Self {
             rt: self.rt.clone(),
+            proxy: self.proxy.clone(),
+            pool_mode: self.pool_mode,
             cancels: self.cancels.clone(),
             limit: self.limit.clone(),
             credentials: Arc::clone(&self.credentials),
@@ -355,6 +415,8 @@ impl<R: Runtime> Clone for Front<R> {
             addresses: Arc::clone(&self.addresses),
             node: Arc::clone(&self.node),
             pools: Arc::clone(&self.pools),
+            coordinator: Arc::clone(&self.coordinator),
+            derived: Arc::clone(&self.derived),
             wait_timeout: self.wait_timeout,
         }
     }
@@ -393,6 +455,13 @@ impl<R: Runtime> Front<R> {
             }
         };
         let tenant = session.tenant().clone();
+        if is_console(&tenant) {
+            if let Err(error) = serve_console(session, || self.console_view()).await {
+                tracing::warn!(%tenant, %error, "an admin console session ended with an error");
+            }
+            drop(admitted);
+            return;
+        }
         let Some(instance) = self
             .policies
             .route(&tenant, |total| rand::random_range(0..total))
@@ -428,6 +497,29 @@ impl<R: Runtime> Front<R> {
         };
         if let Err(error) = forward_cancel(&self.rt, address, target.backend()).await {
             tracing::warn!(instance = %target.instance(), %error, "cannot forward a cancel request");
+        }
+    }
+
+    /// One reading of everything the console reports. Nothing in it is read
+    /// again while a table is written, so a table never mixes two states of
+    /// the node.
+    fn console_view(&self) -> ConsoleView {
+        ConsoleView {
+            proxy: self.proxy.clone(),
+            pool_mode: self.pool_mode.to_owned(),
+            pools: self
+                .pools
+                .stats()
+                .into_iter()
+                .map(|(instance, tenant, stats)| PoolSnapshot {
+                    policy: self.policies.policy(&instance, &tenant),
+                    instance,
+                    tenant,
+                    stats,
+                })
+                .collect(),
+            instances: self.derived.snapshot(),
+            table: self.coordinator.table(),
         }
     }
 

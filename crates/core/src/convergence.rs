@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::allocation::InstanceId;
 use crate::grant::{GrantChannel, GrantSet, Report, Usage};
-use crate::pool::{CloseServer, OpenServer, Pool};
+use crate::pool::{CloseServer, OpenServer, Pool, PoolStats};
 use crate::relay::Welcome;
 use crate::rt::Clock;
 use crate::tenant::TenantId;
@@ -99,6 +99,17 @@ impl<O: OpenServer, K: Clock> ProxyPools<O, K> {
                 )
             },
         )
+    }
+
+    /// What every pool holds right now, for the admin console to read.
+    #[must_use]
+    pub fn stats(&self) -> Vec<(InstanceId, TenantId, PoolStats)> {
+        self.lock()
+            .iter()
+            .map(|((instance, tenant), entry)| {
+                (instance.clone(), tenant.clone(), entry.pool.stats())
+            })
+            .collect()
     }
 
     fn snapshot(&self) -> Vec<(Key, Pool<O, K>)> {
