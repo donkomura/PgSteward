@@ -1393,3 +1393,142 @@ async fn a_statement_parsed_before_the_boundary_is_gone_when_the_next_assignment
     client.send(&terminate_frame()).await;
     served.await.unwrap().unwrap();
 }
+
+async fn expect_listen_refusal(client: &mut Client) {
+    let answer = tokio::time::timeout(ANSWER_TIMEOUT, client.read_message())
+        .await
+        .expect("the listen was never refused");
+    let Message::ErrorResponse(body) = answer else {
+        panic!("expected an ErrorResponse");
+    };
+    let fields = error_fields(&body);
+    assert_eq!(field(&fields, b'S'), "ERROR");
+    assert_eq!(field(&fields, b'C'), "0A000");
+    let message = field(&fields, b'M');
+    assert!(
+        message.contains("LISTEN"),
+        "the refusal must name the command: {message}"
+    );
+    let detail = field(&fields, b'D');
+    assert!(
+        detail.contains("transaction mode"),
+        "the refusal must say why: {detail}"
+    );
+    let hint = field(&fields, b'H');
+    assert!(
+        hint.contains("session mode"),
+        "the refusal must say what to do instead: {hint}"
+    );
+}
+
+#[tokio::test]
+async fn a_listen_never_reaches_the_server_and_ends_the_assignment() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("LISTEN chan")).await;
+    expect_listen_refusal(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+
+    let (boundary, pending, server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    assert!(pending.is_empty());
+    drop(server);
+    assert!(
+        backend.read_to_end().await.is_empty(),
+        "a refused LISTEN must not reach the server"
+    );
+}
+
+#[tokio::test]
+async fn a_text_that_listens_among_other_statements_is_refused_whole() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(&query_frame("BEGIN; LISTEN chan; COMMIT"))
+        .await;
+    expect_listen_refusal(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+
+    let (boundary, _pending, server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    drop(server);
+    assert!(
+        backend.read_to_end().await.is_empty(),
+        "no statement of a refused text may reach the server"
+    );
+}
+
+#[tokio::test]
+async fn a_notify_crosses_to_the_server_unchanged() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("NOTIFY chan, 'payload'")).await;
+    expect_query(&mut backend, "NOTIFY chan, 'payload'").await;
+    backend.send(&command_complete("NOTIFY", b'I')).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+}
+
+#[tokio::test]
+async fn a_parse_that_listens_is_refused_and_only_its_sync_reaches_the_server() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(
+            &[
+                parse_frame("s1", "LISTEN chan"),
+                bind_frame("", "s1"),
+                execute_frame(""),
+                sync_frame(),
+            ]
+            .concat(),
+        )
+        .await;
+    expect_listen_refusal(&mut client).await;
+    expect_sync_alone(&mut backend).await;
+    backend.send(&frame(b'Z', b"I")).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    expect_ready(&mut client, b'I').await;
+}
+
+#[tokio::test]
+async fn a_listen_pipelined_behind_a_query_is_refused_after_that_query_is_answered() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(&[query_frame("BEGIN"), query_frame("LISTEN chan")].concat())
+        .await;
+    expect_query(&mut backend, "BEGIN").await;
+    backend.send(&command_complete("BEGIN", b'T')).await;
+    expect_client_frames(&mut client, b"CZ").await;
+    expect_listen_refusal(&mut client).await;
+    expect_ready(&mut client, b'T').await;
+
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "an open transaction must hold the assignment past a refusal"
+    );
+
+    client.send(&query_frame("COMMIT")).await;
+    expect_query(&mut backend, "COMMIT").await;
+    backend.send(&command_complete("COMMIT", b'I')).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+}

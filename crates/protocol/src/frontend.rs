@@ -62,13 +62,25 @@ pub enum CloseTarget<'a> {
     Portal(&'a str),
 }
 
-pub fn decode_parse(body: &[u8]) -> Result<&str, FrontendError> {
-    let (statement, _) = cstr(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parse<'a> {
+    pub statement: &'a str,
+    pub query: &'a str,
+}
+
+pub fn decode_query(body: &[u8]) -> Result<&str, FrontendError> {
+    let (query, _) = cstr(body, FrontendTag::Query, "the query text is not terminated")?;
+    Ok(query)
+}
+
+pub fn decode_parse(body: &[u8]) -> Result<Parse<'_>, FrontendError> {
+    let (statement, rest) = cstr(
         body,
         FrontendTag::Parse,
         "the statement name is not terminated",
     )?;
-    Ok(statement)
+    let (query, _) = cstr(rest, FrontendTag::Parse, "the query text is not terminated")?;
+    Ok(Parse { statement, query })
 }
 
 pub fn decode_bind(body: &[u8]) -> Result<&str, FrontendError> {

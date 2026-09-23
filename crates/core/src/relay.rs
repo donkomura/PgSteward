@@ -90,12 +90,14 @@ where
     let mut tracker = ReadyTracker::new();
     let mut statements = PreparedStatements::new();
     loop {
-        if forward_requests(client, pending, server, &mut tracker, &mut statements).await?
-            == Requests::Terminated
-        {
-            return Ok(Boundary::ClientClosed {
-                may_release: tracker.may_release(),
-            });
+        match forward_requests(client, pending, server, &mut tracker, &mut statements).await? {
+            Requests::Terminated => {
+                return Ok(Boundary::ClientClosed {
+                    may_release: tracker.may_release(),
+                });
+            }
+            Requests::Answered if tracker.may_release() => return Ok(Boundary::Released),
+            Requests::Answered | Requests::Drained => {}
         }
         let event = tokio::select! {
             read = fill(client, pending) => Event::FromClient(read?),
@@ -131,9 +133,9 @@ enum Event {
     FromServer(Option<Frame>),
 }
 
-#[derive(PartialEq, Eq)]
 enum Requests {
     Drained,
+    Answered,
     Terminated,
 }
 
@@ -166,6 +168,19 @@ where
             Verdict::Reject(statement) => {
                 encode_error_response(&no_such_statement(statement), &mut refusals);
             }
+            Verdict::RejectListen if tag == FrontendTag::Query => {
+                if tracker.outstanding() > 0 {
+                    hold(&frame, pending);
+                    break;
+                }
+                encode_error_response(&listen_unsupported(), &mut refusals);
+                encode_ready_for_query(tracker.status(), &mut refusals);
+                requests = Requests::Answered;
+            }
+            Verdict::RejectListen => {
+                statements.discard_until_sync();
+                encode_error_response(&listen_unsupported(), &mut refusals);
+            }
         }
     }
     if !out.is_empty() {
@@ -176,6 +191,38 @@ where
         client.flush().await?;
     }
     Ok(requests)
+}
+
+/// Puts a message back where it was read from, ahead of whatever else is
+/// waiting.
+///
+/// The client is owed the answers already in flight before it is owed this
+/// message's refusal, and those answers end with a `ReadyForQuery` of their
+/// own. Holding the message until then keeps the two in the order the client
+/// counts them in.
+fn hold(frame: &Frame, pending: &mut BytesMut) {
+    let mut held = BytesMut::new();
+    encode_frame(frame.tag, &frame.body, &mut held);
+    held.extend_from_slice(pending);
+    *pending = held;
+}
+
+fn listen_unsupported() -> ErrorResponse {
+    ErrorResponse::error(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "LISTEN is not supported on a pooled server connection",
+    )
+    .with_detail(
+        "PgSteward hands the server connection to the next client at every transaction \
+         boundary in transaction mode, and the reset in between runs UNLISTEN *: a \
+         registration made here would stop receiving notifications with nothing to show \
+         for it.",
+    )
+    .with_hint(
+        "Run this tenant in session mode if the client has to listen, or poll for the \
+         change the notification announces. NOTIFY needs no registration and crosses \
+         unchanged.",
+    )
 }
 
 fn no_such_statement(statement: &str) -> ErrorResponse {
