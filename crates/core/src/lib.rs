@@ -3,6 +3,7 @@ pub mod allocation;
 pub mod auth;
 pub mod budget;
 pub mod cancel;
+pub mod console;
 pub mod convergence;
 pub mod grant;
 pub mod inspect;
