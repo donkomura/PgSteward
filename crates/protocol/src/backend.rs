@@ -12,6 +12,8 @@ pub mod sqlstate {
     pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const SYNTAX_ERROR: &str = "42601";
+    pub const UNDEFINED_OBJECT: &str = "42704";
+    pub const INVALID_PARAMETER_VALUE: &str = "22023";
 }
 
 const TEXT_OID: u32 = 25;

@@ -7,6 +7,33 @@ use crate::tenant::TenantId;
 
 const WILDCARD: &str = "*";
 
+/// The parts of a tenant's share a setting writes. What it leaves out keeps
+/// the value the cluster configuration already holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicyChange {
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+    pub weight: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SettingError {
+    #[error("the cluster configuration writes no tenant rule named `{tenant}`")]
+    NoSuchTenant { tenant: String },
+    #[error("a minimum of {min} is above the maximum of {max}")]
+    MinAboveMax { min: u32, max: u32 },
+    #[error("a weight of 0 would leave the tenant out of every allocation")]
+    ZeroWeight,
+    #[error(
+        "the minimums on instance `{instance}` would total {minimums}, above its total budget of {budget}"
+    )]
+    AboveBudget {
+        instance: InstanceId,
+        minimums: u32,
+        budget: u32,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantRule {
     pub instances: Vec<InstanceId>,
@@ -39,6 +66,75 @@ impl Policies {
     pub fn tenant(mut self, key: impl Into<String>, rule: TenantRule) -> Self {
         self.rules.insert(key.into(), rule);
         self
+    }
+
+    #[must_use]
+    pub fn rule(&self, tenant: &str) -> Option<&TenantRule> {
+        self.rules.get(tenant)
+    }
+
+    /// The rules with `change` written into the one named `tenant`.
+    ///
+    /// The name is a rule as the cluster configuration writes it, not a tenant
+    /// the rule covers: a setting moves a rule, and the fallback from
+    /// `user@database` to `user` to `*` would otherwise write the value into a
+    /// rule the operator did not name. `budget` answers an instance's total
+    /// budget, or nothing while it has not been derived yet.
+    pub fn change_tenant(
+        &self,
+        tenant: &str,
+        change: PolicyChange,
+        budget: impl Fn(&InstanceId) -> Option<u32>,
+    ) -> Result<Self, SettingError> {
+        let rule = self
+            .rule(tenant)
+            .ok_or_else(|| SettingError::NoSuchTenant {
+                tenant: tenant.to_owned(),
+            })?;
+        let policy = TenantPolicy {
+            min: change.min.unwrap_or(rule.policy.min),
+            max: change.max.unwrap_or(rule.policy.max),
+            weight: match change.weight {
+                Some(weight) => NonZeroU32::new(weight).ok_or(SettingError::ZeroWeight)?,
+                None => rule.policy.weight,
+            },
+        };
+        if policy.min > policy.max {
+            return Err(SettingError::MinAboveMax {
+                min: policy.min,
+                max: policy.max,
+            });
+        }
+        let instances = rule.instances.clone();
+        let mut changed = self.clone();
+        changed
+            .rules
+            .get_mut(tenant)
+            .expect("the rule was found above")
+            .policy = policy;
+        for instance in instances {
+            let minimums = changed.minimums_on(&instance);
+            if let Some(budget) = budget(&instance)
+                && minimums > budget
+            {
+                return Err(SettingError::AboveBudget {
+                    instance,
+                    minimums,
+                    budget,
+                });
+            }
+        }
+        Ok(changed)
+    }
+
+    /// What every rule on `instance` reserves together.
+    #[must_use]
+    pub fn minimums_on(&self, instance: &InstanceId) -> u32 {
+        self.rules
+            .values()
+            .filter(|rule| rule.instances.contains(instance))
+            .map(|rule| rule.policy.min)
+            .fold(0, u32::saturating_add)
     }
 
     #[must_use]
