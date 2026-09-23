@@ -1217,3 +1217,169 @@ async fn the_cancel_key_is_forgotten_when_the_client_leaves() {
     assert!(registry.target(key).is_none());
     assert!(registry.is_empty());
 }
+
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+
+const DISABLE_HINTS: [&str; 4] = [
+    "pgbouncer=true",
+    "prepareThreshold=0",
+    "statement_cache_size=0",
+    "statement_cache_capacity=0",
+];
+
+fn field(fields: &[(u8, String)], kind: u8) -> String {
+    fields
+        .iter()
+        .find_map(|(field, value)| (*field == kind).then(|| value.clone()))
+        .unwrap_or_else(|| panic!("the error carries no {} field", char::from(kind)))
+}
+
+async fn expect_refusal(client: &mut Client, statement: &str) {
+    let answer = tokio::time::timeout(ANSWER_TIMEOUT, client.read_message())
+        .await
+        .expect("the bind was never refused");
+    let Message::ErrorResponse(body) = answer else {
+        panic!("expected an ErrorResponse");
+    };
+    let fields = error_fields(&body);
+    assert_eq!(field(&fields, b'S'), "ERROR");
+    assert_eq!(field(&fields, b'C'), "26000");
+    let message = field(&fields, b'M');
+    assert!(
+        message.contains(&format!("\"{statement}\"")),
+        "the refusal must name the statement: {message}"
+    );
+    let detail = field(&fields, b'D');
+    assert!(
+        detail.contains("transaction mode"),
+        "the refusal must say why: {detail}"
+    );
+    let hint = field(&fields, b'H');
+    for disable in DISABLE_HINTS {
+        assert!(
+            hint.contains(disable),
+            "the refusal must say how to turn prepared statements off: {hint}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bind_to_a_statement_this_assignment_never_parsed_never_reaches_the_server() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(&[bind_frame("", "s1"), execute_frame(""), sync_frame()].concat())
+        .await;
+    expect_refusal(&mut client, "s1").await;
+
+    expect_backend_frames(&mut backend, b"S").await;
+    backend.send(&frame(b'Z', b"I")).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    expect_ready(&mut client, b'I').await;
+}
+
+#[tokio::test]
+async fn a_statement_parsed_on_this_assignment_binds_without_a_refusal() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client
+        .send(
+            &[
+                parse_frame("s1", "SELECT 1"),
+                bind_frame("", "s1"),
+                execute_frame(""),
+                sync_frame(),
+            ]
+            .concat(),
+        )
+        .await;
+    expect_backend_frames(&mut backend, b"PBES").await;
+    backend
+        .send(&[extended_select_one_result(), frame(b'Z', b"I")].concat())
+        .await;
+    expect_client_frames(&mut client, b"12TDCZ").await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+}
+
+#[tokio::test]
+async fn a_refused_bind_leaves_the_transaction_status_to_the_server() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("BEGIN")).await;
+    expect_query(&mut backend, "BEGIN").await;
+    backend.send(&command_complete("BEGIN", b'T')).await;
+    expect_client_frames(&mut client, b"CZ").await;
+
+    client
+        .send(&[bind_frame("", "s1"), execute_frame(""), sync_frame()].concat())
+        .await;
+    expect_refusal(&mut client, "s1").await;
+    expect_backend_frames(&mut backend, b"S").await;
+    backend.send(&frame(b'Z', b"T")).await;
+    expect_ready(&mut client, b'T').await;
+
+    tokio::task::yield_now().await;
+    assert!(
+        !assignment.is_finished(),
+        "an open transaction must hold the assignment past a refusal"
+    );
+
+    client.send(&query_frame("COMMIT")).await;
+    expect_query(&mut backend, "COMMIT").await;
+    backend.send(&command_complete("COMMIT", b'I')).await;
+
+    let (boundary, _pending, _server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+}
+
+#[tokio::test]
+async fn a_statement_parsed_before_the_boundary_is_gone_when_the_next_assignment_binds_it() {
+    let backends = Backends::new();
+    let pool = pool_of(backends.clone(), 1);
+
+    let (mut client, session) = client_session(&[]).await;
+    let served = spawn_transaction_mode(session, pool, Welcome::default(), cancels());
+    client.read_greeting().await;
+    let mut backend = backends.accept().await;
+
+    client
+        .send(&[parse_frame("s1", "SELECT 1"), sync_frame()].concat())
+        .await;
+    expect_backend_frames(&mut backend, b"PS").await;
+    backend
+        .send(&[frame(b'1', &[]), frame(b'Z', b"I")].concat())
+        .await;
+    expect_client_frames(&mut client, b"1Z").await;
+    expect_query(&mut backend, "DISCARD ALL").await;
+    backend.send(&command_complete("DISCARD ALL", b'I')).await;
+
+    client
+        .send(&[bind_frame("", "s1"), execute_frame(""), sync_frame()].concat())
+        .await;
+    expect_refusal(&mut client, "s1").await;
+    expect_backend_frames(&mut backend, b"S").await;
+    backend.send(&frame(b'Z', b"I")).await;
+    expect_ready(&mut client, b'I').await;
+    expect_query(&mut backend, "DISCARD ALL").await;
+    backend.send(&command_complete("DISCARD ALL", b'I')).await;
+
+    client.send(&query_frame("SELECT 1")).await;
+    expect_query(&mut backend, "SELECT 1").await;
+    backend.send(&select_one_result()).await;
+    expect_client_frames(&mut client, b"TDCZ").await;
+    expect_query(&mut backend, "DISCARD ALL").await;
+    backend.send(&command_complete("DISCARD ALL", b'I')).await;
+
+    client.send(&terminate_frame()).await;
+    served.await.unwrap().unwrap();
+}
