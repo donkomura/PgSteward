@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 
 use pgsteward_core::allocation::{Holder, InstanceId, ProxyId};
 use pgsteward_core::grant::{GrantChannel, InProcessCoordinator, Report, TenantPolicy, Usage};
-use pgsteward_core::policy::{Policies, TenantRule};
+use pgsteward_core::policy::{Policies, PolicyChange, SettingError, TenantRule};
 use pgsteward_core::tenant::TenantId;
 use pgsteward_sched::fair::WeightedMaxMinFair;
 use proptest::prelude::*;
@@ -445,4 +445,52 @@ fn a_tenant_is_granted_nothing_on_an_instance_its_rule_does_not_list() {
             .get(&replica, &tenant("alice")),
         0
     );
+}
+
+#[test]
+fn a_tenant_setting_moves_the_grants_without_waiting_for_the_next_round() {
+    let coordinator = coordinator(10, &["alice"]);
+    report(&coordinator, &[("alice", 8, 0)]);
+    coordinator.reconcile().unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 8);
+
+    coordinator
+        .set_tenant(
+            "alice",
+            PolicyChange {
+                max: Some(3),
+                ..PolicyChange::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(granted(&coordinator, "alice"), 3);
+}
+
+#[test]
+fn a_refused_tenant_setting_leaves_the_rule_that_was_in_force() {
+    let coordinator = coordinator(10, &["alice"]);
+    report(&coordinator, &[("alice", 8, 0)]);
+    coordinator.reconcile().unwrap();
+
+    let error = coordinator
+        .set_tenant(
+            "alice",
+            PolicyChange {
+                min: Some(11),
+                ..PolicyChange::default()
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        SettingError::AboveBudget {
+            instance: primary(),
+            minimums: 11,
+            budget: 10,
+        }
+    );
+    assert_eq!(coordinator.policies().rule("alice").unwrap().policy.min, 0);
+    assert_eq!(granted(&coordinator, "alice"), 8);
 }
