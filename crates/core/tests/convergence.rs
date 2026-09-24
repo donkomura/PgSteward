@@ -422,3 +422,40 @@ async fn a_tenant_without_a_minimum_keeps_no_pool_once_its_clients_are_gone() {
     coordinating.abort();
     converging.abort();
 }
+
+#[tokio::test(start_paused = true)]
+async fn draining_closes_every_connection_whatever_the_grants_say() {
+    let opener = Opener::default();
+    let pools = ProxyPools::new();
+    let alice = pool(opener.clone());
+    pools.insert(primary(), tenant("alice"), alice.clone());
+    alice.converge(2).await;
+    let first = alice.acquire().await.unwrap();
+    let second = alice.acquire().await.unwrap();
+    drop(first);
+    drop(second);
+    assert_eq!(opener.live(), 2);
+
+    let closed = pools.drain().await;
+
+    assert_eq!(closed, 2);
+    assert_eq!(opener.live(), 0);
+    assert_eq!(pools.occupied(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn draining_leaves_the_connection_a_client_still_holds() {
+    let opener = Opener::default();
+    let pools = ProxyPools::new();
+    let alice = pool(opener.clone());
+    pools.insert(primary(), tenant("alice"), alice.clone());
+    alice.converge(1).await;
+    let held = alice.acquire().await.unwrap();
+
+    let closed = pools.drain().await;
+
+    assert_eq!(closed, 0);
+    assert_eq!(opener.live(), 1);
+    assert_eq!(pools.occupied(), 1);
+    drop(held);
+}
