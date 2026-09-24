@@ -258,3 +258,63 @@ async fn a_tenant_setting_written_on_the_console_changes_what_the_tables_report(
         "a minimum above the total budget is refused"
     );
 }
+
+#[tokio::test]
+async fn a_margin_written_on_the_console_changes_the_budget_that_is_derived() {
+    let container = Postgres::default()
+        .with_host_auth()
+        .with_tag("16")
+        .with_cmd(["postgres", "-c", MAX_CONNECTIONS_SETTING])
+        .start()
+        .await
+        .unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let instance = format!("127.0.0.1:{port}");
+    let serving = serve(
+        TokioRuntime::new(),
+        node_config(),
+        cluster_config(&instance),
+        ServeOptions {
+            margin: 0,
+            ..ServeOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let console = through(serving.local_addr(), TENANT, DATABASE).await;
+    let before = table(&console, "SHOW INSTANCES").await;
+    assert_eq!(before[0].get("margin"), Some("0"));
+    let budget: u32 = before[0]
+        .get("total_budget")
+        .expect("a total budget")
+        .parse()
+        .unwrap();
+
+    console
+        .simple_query(&format!("SET INSTANCE {instance} margin = 4"))
+        .await
+        .unwrap();
+
+    let after = table(&console, "SHOW INSTANCES").await;
+    assert_eq!(after[0].get("margin"), Some("4"));
+    assert_eq!(
+        after[0].get("total_budget"),
+        Some((budget - 4).to_string().as_str()),
+        "the written margin is taken off the budget"
+    );
+    assert_eq!(
+        serving.budget(&InstanceId::new(&instance)),
+        budget - 4,
+        "the allocation table holds the budget the setting derived"
+    );
+
+    let error = console
+        .simple_query("SET INSTANCE replica margin = 4")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code().map(tokio_postgres::error::SqlState::code),
+        Some("42704"),
+        "a name no instance is configured under is refused"
+    );
+}

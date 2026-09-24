@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
@@ -594,7 +595,7 @@ async fn a_tenant_setting_reaches_the_node_with_the_name_as_it_was_written() {
     assert_eq!(complete.tag().expect("a UTF-8 tag"), "SET");
     client.read_ready().await;
     assert_eq!(
-        *written.lock().expect("the written settings lock"),
+        *written.tenants.lock().expect("the written settings lock"),
         vec![(
             "app web@reports".to_owned(),
             PolicyChange {
@@ -651,14 +652,42 @@ async fn a_name_no_rule_is_written_as_is_refused_as_an_undefined_object() {
 }
 
 #[tokio::test]
-async fn set_instance_is_of_the_language_this_node_does_not_serve_yet() {
-    let (mut client, _console) = console(Views::repeating(empty_view())).await;
+async fn an_instance_setting_reaches_the_node_with_the_name_as_it_was_written() {
+    let (mut client, _console, written) = node(Views::repeating(empty_view()), None).await;
     client.read_greeting().await;
 
-    client.query("SET INSTANCE primary margin = 20").await;
+    client
+        .query("SET INSTANCE \"db primary\" margin = 20")
+        .await;
+
+    let Message::CommandComplete(complete) = client.read_message().await else {
+        panic!("a setting is answered with a command tag");
+    };
+    assert_eq!(complete.tag().expect("a UTF-8 tag"), "SET");
+    client.read_ready().await;
+    assert_eq!(
+        *written.margins.lock().expect("the written margins lock"),
+        vec![("db primary".to_owned(), 20)]
+    );
+}
+
+#[tokio::test]
+async fn a_name_no_instance_is_configured_under_is_refused_as_an_undefined_object() {
+    let (mut client, _console) = console_refusing(SettingError::NoSuchInstance {
+        instance: instance("replica"),
+    })
+    .await;
+    client.read_greeting().await;
+
+    client.query("SET INSTANCE replica margin = 20").await;
 
     let error = client.read_error().await;
-    assert_eq!(error.code, "0A000");
+    assert_eq!(error.code, "42704");
+    assert!(error.message.contains("replica"));
+    assert!(
+        error.hint.unwrap_or_default().contains("SHOW INSTANCES"),
+        "the refusal points at the table that names the instances"
+    );
     client.read_ready().await;
 }
 
@@ -754,8 +783,17 @@ impl Views {
 /// settings it writes are kept.
 struct Node {
     views: Views,
-    written: Arc<Mutex<Vec<(String, PolicyChange)>>>,
+    written: Written,
     refusal: Option<SettingError>,
+}
+
+impl Node {
+    fn answer(&self) -> Result<(), SettingError> {
+        match &self.refusal {
+            Some(refusal) => Err(refusal.clone()),
+            None => Ok(()),
+        }
+    }
 }
 
 impl ConsoleNode for Node {
@@ -765,13 +803,25 @@ impl ConsoleNode for Node {
 
     fn set_tenant(&self, tenant: &str, change: PolicyChange) -> Result<(), SettingError> {
         self.written
+            .tenants
             .lock()
             .expect("the written settings lock")
             .push((tenant.to_owned(), change));
-        match &self.refusal {
-            Some(refusal) => Err(refusal.clone()),
-            None => Ok(()),
-        }
+        self.answer()
+    }
+
+    fn set_instance(
+        &self,
+        instance: &str,
+        margin: u32,
+    ) -> impl Future<Output = Result<(), SettingError>> + Send {
+        self.written
+            .margins
+            .lock()
+            .expect("the written margins lock")
+            .push((instance.to_owned(), margin));
+        let answer = self.answer();
+        async move { answer }
     }
 }
 
@@ -785,7 +835,12 @@ async fn console_refusing(refusal: SettingError) -> (Client, JoinHandle<Result<(
     (client, console)
 }
 
-type Written = Arc<Mutex<Vec<(String, PolicyChange)>>>;
+/// Where a test reads back the settings a console session wrote.
+#[derive(Clone, Default)]
+struct Written {
+    tenants: Arc<Mutex<Vec<(String, PolicyChange)>>>,
+    margins: Arc<Mutex<Vec<(String, u32)>>>,
+}
 
 async fn node(
     views: Views,
@@ -816,10 +871,10 @@ async fn node(
         client.read_message().await,
         Message::AuthenticationOk
     ));
-    let written: Written = Arc::new(Mutex::new(Vec::new()));
+    let written = Written::default();
     let node = Node {
         views,
-        written: Arc::clone(&written),
+        written: written.clone(),
         refusal,
     };
     (client, tokio::spawn(serve_console(session, node)), written)
