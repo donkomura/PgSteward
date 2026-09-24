@@ -1,12 +1,17 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use pgsteward_core::allocation::{Holder, InstanceId, ProxyId};
+use pgsteward_core::budget::{BudgetChange, InstanceBudget, ServerLimits};
 use pgsteward_core::grant::{GrantChannel, InProcessCoordinator, Report, TenantPolicy, Usage};
 use pgsteward_core::policy::{Policies, PolicyChange, SettingError, TenantRule};
+use pgsteward_core::rt::Instant;
 use pgsteward_core::tenant::TenantId;
 use pgsteward_sched::fair::WeightedMaxMinFair;
 use proptest::prelude::*;
+
+const WINDOW: Duration = Duration::from_secs(60);
 
 fn primary() -> InstanceId {
     InstanceId::new("primary")
@@ -30,9 +35,29 @@ fn open_policy() -> TenantPolicy {
 
 fn coordinator(budget: u32, tenants: &[&str]) -> InProcessCoordinator<WeightedMaxMinFair> {
     let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
-    coordinator.set_budget(primary(), budget);
+    coordinator.add_instance(primary(), flat(budget));
     coordinator.set_policies(policies(tenants, open_policy()));
     coordinator
+}
+
+fn limits(max_connections: u32) -> ServerLimits {
+    ServerLimits {
+        max_connections,
+        superuser_reserved_connections: 3,
+        reserved_connections: 2,
+    }
+}
+
+fn flat(total: u32) -> InstanceBudget {
+    InstanceBudget::new(
+        ServerLimits {
+            max_connections: total,
+            superuser_reserved_connections: 0,
+            reserved_connections: 0,
+        },
+        0,
+        WINDOW,
+    )
 }
 
 fn policies(tenants: &[&str], policy: TenantPolicy) -> Policies {
@@ -103,7 +128,7 @@ fn nothing_is_granted_before_a_reconciliation() {
 #[test]
 fn a_tenant_without_demand_is_granted_nothing_despite_its_minimum() {
     let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
-    coordinator.set_budget(primary(), 10);
+    coordinator.add_instance(primary(), flat(10));
     coordinator.set_policies(policies(
         &["alice"],
         TenantPolicy {
@@ -275,7 +300,7 @@ fn a_larger_budget_is_granted_at_once() {
     coordinator.reconcile().unwrap();
     assert_eq!(granted(&coordinator, "alice"), 4);
 
-    coordinator.set_budget(primary(), 8);
+    coordinator.add_instance(primary(), flat(8));
     coordinator.reconcile().unwrap();
 
     assert_eq!(granted(&coordinator, "alice"), 6);
@@ -288,7 +313,7 @@ fn a_smaller_budget_lowers_the_grants_with_it() {
     coordinator.reconcile().unwrap();
     report(&coordinator, &[("alice", 4, 4)]);
 
-    coordinator.set_budget(primary(), 2);
+    coordinator.add_instance(primary(), flat(2));
     coordinator.reconcile().unwrap();
 
     assert_eq!(granted(&coordinator, "alice"), 2);
@@ -302,7 +327,7 @@ fn a_smaller_budget_holds_back_growth_until_the_excess_is_closed() {
     coordinator.reconcile().unwrap();
     report(&coordinator, &[("alice", 4, 4)]);
 
-    coordinator.set_budget(primary(), 2);
+    coordinator.add_instance(primary(), flat(2));
     report(&coordinator, &[("alice", 4, 4), ("bob", 2, 0)]);
     coordinator.reconcile().unwrap();
 
@@ -313,6 +338,61 @@ fn a_smaller_budget_holds_back_growth_until_the_excess_is_closed() {
     coordinator.reconcile().unwrap();
 
     assert_eq!(granted(&coordinator, "bob"), 1);
+}
+
+#[test]
+fn the_coordinator_allocates_against_the_budget_it_derives() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+    coordinator.add_instance(primary(), InstanceBudget::new(limits(200), 15, WINDOW));
+    coordinator.observe_instance(&primary(), Instant::now(), 30);
+    coordinator.set_policies(policies(&["alice"], open_policy()));
+    report(&coordinator, &[("alice", 500, 0)]);
+
+    coordinator.reconcile().unwrap();
+
+    assert_eq!(coordinator.table().budget(&primary()), 150);
+    assert_eq!(granted(&coordinator, "alice"), 150);
+}
+
+#[test]
+fn foreign_connections_that_appear_shrink_what_the_coordinator_allocates() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+    coordinator.add_instance(primary(), InstanceBudget::new(limits(200), 15, WINDOW));
+    coordinator.set_policies(policies(&["alice"], open_policy()));
+
+    let change = coordinator.observe_instance(&primary(), Instant::now(), 50);
+
+    assert_eq!(change, Some(BudgetChange::Shrank { from: 180, to: 130 }));
+    coordinator.reconcile().unwrap();
+    assert_eq!(coordinator.table().budget(&primary()), 130);
+}
+
+#[test]
+fn the_coordinator_answers_how_it_derived_each_budget() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+    coordinator.add_instance(primary(), InstanceBudget::new(limits(200), 15, WINDOW));
+    coordinator.observe_instance(&primary(), Instant::now(), 30);
+
+    let derived = coordinator.instances();
+
+    assert_eq!(derived.len(), 1);
+    let (instance, budget) = &derived[0];
+    assert_eq!(instance, &primary());
+    assert_eq!(budget.total(), 150);
+    assert_eq!(budget.inputs().limits, limits(200));
+    assert_eq!(budget.inputs().foreign_peak, 30);
+    assert_eq!(budget.inputs().margin, 15);
+}
+
+#[test]
+fn an_instance_the_coordinator_does_not_hold_is_not_observed() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+
+    assert_eq!(
+        coordinator.observe_instance(&primary(), Instant::now(), 30),
+        None
+    );
+    assert!(coordinator.instances().is_empty());
 }
 
 #[derive(Debug, Clone)]
@@ -411,7 +491,7 @@ proptest! {
 #[test]
 fn a_tenant_covered_by_the_wildcard_is_granted() {
     let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
-    coordinator.set_budget(primary(), 10);
+    coordinator.add_instance(primary(), flat(10));
     coordinator.set_policies(policies(&["*"], open_policy()));
     report(&coordinator, &[("alice", 3, 0)]);
 
@@ -424,8 +504,8 @@ fn a_tenant_covered_by_the_wildcard_is_granted() {
 fn a_tenant_is_granted_nothing_on_an_instance_its_rule_does_not_list() {
     let replica = InstanceId::new("replica");
     let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
-    coordinator.set_budget(primary(), 10);
-    coordinator.set_budget(replica.clone(), 10);
+    coordinator.add_instance(primary(), flat(10));
+    coordinator.add_instance(replica.clone(), flat(10));
     coordinator.set_policies(policies(&["alice"], open_policy()));
     coordinator.report(Report::new(0).usage(
         replica.clone(),

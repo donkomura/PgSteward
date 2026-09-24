@@ -9,8 +9,9 @@ use tokio::sync::watch;
 use crate::allocation::{
     AllocationTable, Desired, Entry, Holder, InstanceId, PreconditionError, ProxyId,
 };
+use crate::budget::{BudgetChange, InstanceBudget, TotalBudget};
 use crate::policy::{Policies, PolicyChange, SettingError};
-use crate::rt::Clock;
+use crate::rt::{Clock, Instant};
 use crate::tenant::TenantId;
 
 type Slot = (InstanceId, TenantId);
@@ -119,7 +120,7 @@ pub struct InProcessCoordinator<A> {
 #[derive(Debug, Default)]
 struct State {
     table: AllocationTable,
-    budgets: BTreeMap<InstanceId, u32>,
+    budgets: BTreeMap<InstanceId, InstanceBudget>,
     policies: Policies,
     demand: BTreeMap<Slot, u32>,
     held: BTreeMap<Slot, Held>,
@@ -149,8 +150,38 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         }
     }
 
-    pub fn set_budget(&self, instance: InstanceId, budget: u32) {
+    /// Takes `instance` under the coordinator with the total budget derived
+    /// for it. The budget is derived here rather than reported as a number,
+    /// because the margin it deducts is a cluster setting an operator writes
+    /// and a setting has one home.
+    pub fn add_instance(&self, instance: InstanceId, budget: InstanceBudget) {
         self.lock().budgets.insert(instance, budget);
+    }
+
+    /// Re-derives an instance's total budget from the connections that belong
+    /// to someone else, and answers which way it moved. An instance the
+    /// coordinator does not hold is not observed at all.
+    pub fn observe_instance(
+        &self,
+        instance: &InstanceId,
+        at: Instant,
+        foreign_connections: u32,
+    ) -> Option<BudgetChange> {
+        self.lock()
+            .budgets
+            .get_mut(instance)
+            .map(|budget| budget.observe(at, foreign_connections))
+    }
+
+    /// Each instance's total budget together with the parts it was derived
+    /// from, in the order the instances are named.
+    #[must_use]
+    pub fn instances(&self) -> Vec<(InstanceId, TotalBudget)> {
+        self.lock()
+            .budgets
+            .iter()
+            .map(|(instance, budget)| (instance.clone(), budget.current()))
+            .collect()
     }
 
     pub fn set_policies(&self, policies: Policies) {
@@ -169,7 +200,10 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         {
             let mut state = self.lock();
             let changed = state.policies.change_tenant(tenant, change, |instance| {
-                state.budgets.get(instance).copied()
+                state
+                    .budgets
+                    .get(instance)
+                    .map(|budget| budget.current().total())
             })?;
             state.policies = changed;
         }
@@ -225,7 +259,8 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
 
     fn desired_state(&self, state: &State) -> Entry {
         let mut entry = Entry::new();
-        for (instance, &budget) in &state.budgets {
+        for (instance, derived) in &state.budgets {
+            let budget = derived.current().total();
             let tenants: BTreeSet<&TenantId> = state
                 .demand
                 .keys()

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pgsteward_core::allocation::{InstanceId, ProxyId};
+use pgsteward_core::budget::{InstanceBudget, ServerLimits};
 use pgsteward_core::convergence::ProxyPools;
 use pgsteward_core::grant::{GrantChannel, GrantSet, InProcessCoordinator, TenantPolicy};
 use pgsteward_core::policy::{Policies, TenantRule};
@@ -89,10 +90,22 @@ fn pool(opener: Opener) -> Pool<Opener, TokioRuntime> {
     )
 }
 
+fn flat(total: u32) -> InstanceBudget {
+    InstanceBudget::new(
+        ServerLimits {
+            max_connections: total,
+            superuser_reserved_connections: 0,
+            reserved_connections: 0,
+        },
+        0,
+        Duration::from_secs(60),
+    )
+}
+
 fn coordinator(budget: u32, tenants: &[&str]) -> Arc<InProcessCoordinator<WeightedMaxMinFair>> {
     let coordinator =
         InProcessCoordinator::new(ProxyId::new("proxy-1"), WeightedMaxMinFair::default());
-    coordinator.set_budget(primary(), budget);
+    coordinator.add_instance(primary(), flat(budget));
     coordinator.set_policies(tenants.iter().fold(
         Policies::new().instance(primary(), NonZeroU32::new(1).unwrap()),
         |policies, user| {
