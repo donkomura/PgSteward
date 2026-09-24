@@ -1,5 +1,5 @@
 use std::num::NonZeroU32;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bytes::{BufMut, BytesMut};
 use fallible_iterator::FallibleIterator;
@@ -7,10 +7,11 @@ use pgsteward_core::allocation::{AllocationTable, Desired, Entry, Holder, Instan
 use pgsteward_core::auth::TrustAll;
 use pgsteward_core::budget::{BudgetInputs, ServerLimits, TotalBudget};
 use pgsteward_core::console::{
-    ConsoleError, ConsoleView, DATABASE, InstanceSnapshot, PoolSnapshot, ResultSet, is_console,
-    serve_console, show_budget, show_instances, show_pools,
+    ConsoleError, ConsoleNode, ConsoleView, DATABASE, InstanceSnapshot, PoolSnapshot, ResultSet,
+    is_console, serve_console, show_budget, show_instances, show_pools,
 };
 use pgsteward_core::grant::TenantPolicy;
+use pgsteward_core::policy::{PolicyChange, SettingError};
 use pgsteward_core::pool::PoolStats;
 use pgsteward_core::session::{Accepted, accept};
 use pgsteward_core::tenant::TenantId;
@@ -579,6 +580,89 @@ async fn a_command_of_the_language_this_node_does_not_serve_yet_says_which_it_se
 }
 
 #[tokio::test]
+async fn a_tenant_setting_reaches_the_node_with_the_name_as_it_was_written() {
+    let (mut client, _console, written) = node(Views::repeating(empty_view()), None).await;
+    client.read_greeting().await;
+
+    client
+        .query("SET TENANT \"app web@reports\" min = 2, weight = 3")
+        .await;
+
+    let Message::CommandComplete(complete) = client.read_message().await else {
+        panic!("a setting is answered with a command tag");
+    };
+    assert_eq!(complete.tag().expect("a UTF-8 tag"), "SET");
+    client.read_ready().await;
+    assert_eq!(
+        *written.lock().expect("the written settings lock"),
+        vec![(
+            "app web@reports".to_owned(),
+            PolicyChange {
+                min: Some(2),
+                max: None,
+                weight: Some(3),
+            }
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_setting_the_node_refuses_says_why_and_the_session_goes_on() {
+    let (mut client, _console) = console_refusing(SettingError::AboveBudget {
+        instance: instance("primary"),
+        minimums: 45,
+        budget: 40,
+    })
+    .await;
+    client.read_greeting().await;
+
+    client.query("SET TENANT app_web min = 45").await;
+
+    let error = client.read_error().await;
+    assert_eq!(error.code, "22023");
+    assert!(
+        error.message.contains("primary") && error.message.contains("40"),
+        "the refusal names the instance and its total budget, got {:?}",
+        error.message
+    );
+    assert!(
+        error.hint.unwrap_or_default().contains("SHOW INSTANCES"),
+        "the refusal points at the table that explains the budget"
+    );
+    client.read_ready().await;
+    client.query("SHOW POOLS").await;
+    assert_eq!(client.rows().await, 0);
+}
+
+#[tokio::test]
+async fn a_name_no_rule_is_written_as_is_refused_as_an_undefined_object() {
+    let (mut client, _console) = console_refusing(SettingError::NoSuchTenant {
+        tenant: "app_web@orders".to_owned(),
+    })
+    .await;
+    client.read_greeting().await;
+
+    client.query("SET TENANT app_web@orders max = 5").await;
+
+    let error = client.read_error().await;
+    assert_eq!(error.code, "42704");
+    assert!(error.message.contains("app_web@orders"));
+    client.read_ready().await;
+}
+
+#[tokio::test]
+async fn set_instance_is_of_the_language_this_node_does_not_serve_yet() {
+    let (mut client, _console) = console(Views::repeating(empty_view())).await;
+    client.read_greeting().await;
+
+    client.query("SET INSTANCE primary margin = 20").await;
+
+    let error = client.read_error().await;
+    assert_eq!(error.code, "0A000");
+    client.read_ready().await;
+}
+
+#[tokio::test]
 async fn the_console_reads_the_simple_query_protocol_only() {
     let (mut client, _console) = console(Views::repeating(empty_view())).await;
     client.read_greeting().await;
@@ -666,7 +750,47 @@ impl Views {
     }
 }
 
+/// What a console session is given: the views it reads, and where the
+/// settings it writes are kept.
+struct Node {
+    views: Views,
+    written: Arc<Mutex<Vec<(String, PolicyChange)>>>,
+    refusal: Option<SettingError>,
+}
+
+impl ConsoleNode for Node {
+    fn view(&self) -> ConsoleView {
+        self.views.take()
+    }
+
+    fn set_tenant(&self, tenant: &str, change: PolicyChange) -> Result<(), SettingError> {
+        self.written
+            .lock()
+            .expect("the written settings lock")
+            .push((tenant.to_owned(), change));
+        match &self.refusal {
+            Some(refusal) => Err(refusal.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
 async fn console(views: Views) -> (Client, JoinHandle<Result<(), ConsoleError>>) {
+    let (client, console, _) = node(views, None).await;
+    (client, console)
+}
+
+async fn console_refusing(refusal: SettingError) -> (Client, JoinHandle<Result<(), ConsoleError>>) {
+    let (client, console, _) = node(Views::repeating(empty_view()), Some(refusal)).await;
+    (client, console)
+}
+
+type Written = Arc<Mutex<Vec<(String, PolicyChange)>>>;
+
+async fn node(
+    views: Views,
+    refusal: Option<SettingError>,
+) -> (Client, JoinHandle<Result<(), ConsoleError>>, Written) {
     let (client_stream, session_stream) = duplex(DUPLEX_CAPACITY);
     let mut client = Client::new(client_stream);
     let accepting = tokio::spawn(accept(session_stream, TrustAll, None));
@@ -692,10 +816,13 @@ async fn console(views: Views) -> (Client, JoinHandle<Result<(), ConsoleError>>)
         client.read_message().await,
         Message::AuthenticationOk
     ));
-    (
-        client,
-        tokio::spawn(serve_console(session, move || views.take())),
-    )
+    let written: Written = Arc::new(Mutex::new(Vec::new()));
+    let node = Node {
+        views,
+        written: Arc::clone(&written),
+        refusal,
+    };
+    (client, tokio::spawn(serve_console(session, node)), written)
 }
 
 struct Client {
@@ -705,6 +832,7 @@ struct Client {
 
 struct Refusal {
     code: String,
+    message: String,
     hint: Option<String>,
 }
 
@@ -770,17 +898,20 @@ impl Client {
             panic!("expected an ErrorResponse");
         };
         let mut code = None;
+        let mut message = None;
         let mut hint = None;
         let mut fields = body.fields();
         while let Some(field) = fields.next().expect("well-formed error fields") {
             match field.type_() {
                 b'C' => code = Some(text(field.value_bytes())),
+                b'M' => message = Some(text(field.value_bytes())),
                 b'H' => hint = Some(text(field.value_bytes())),
                 _ => {}
             }
         }
         Refusal {
             code: code.expect("a SQLSTATE"),
+            message: message.expect("a message"),
             hint,
         }
     }

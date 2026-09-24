@@ -198,3 +198,63 @@ async fn the_console_refuses_a_text_it_cannot_read_and_goes_on() {
         "the session goes on after a refusal"
     );
 }
+
+#[tokio::test]
+async fn a_tenant_setting_written_on_the_console_changes_what_the_tables_report() {
+    let container = Postgres::default()
+        .with_host_auth()
+        .with_tag("16")
+        .with_cmd(["postgres", "-c", MAX_CONNECTIONS_SETTING])
+        .start()
+        .await
+        .unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let admin = direct(port, "harness-admin").await;
+    admin
+        .simple_query(&format!("CREATE ROLE {TENANT} LOGIN"))
+        .await
+        .unwrap();
+    let instance = format!("127.0.0.1:{port}");
+    let serving = serve(
+        TokioRuntime::new(),
+        node_config(),
+        cluster_config(&instance),
+        ServeOptions {
+            margin: 0,
+            ..ServeOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let proxy = serving.local_addr();
+    let tenant = through(proxy, TENANT, "postgres").await;
+    tenant.simple_query("SELECT 1").await.unwrap();
+    let console = through(proxy, TENANT, DATABASE).await;
+    let unlimited = u32::MAX.to_string();
+    assert_eq!(
+        table(&console, "SHOW POOLS").await[0].get("max"),
+        Some(unlimited.as_str()),
+        "the rule the cluster config wrote holds no maximum of its own"
+    );
+
+    console
+        .simple_query("SET TENANT \"*\" max = 1")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        table(&console, "SHOW POOLS").await[0].get("max"),
+        Some("1"),
+        "the table reports the setting the console wrote"
+    );
+
+    let error = console
+        .simple_query("SET TENANT \"*\" min = 999")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code().map(tokio_postgres::error::SqlState::code),
+        Some("22023"),
+        "a minimum above the total budget is refused"
+    );
+}

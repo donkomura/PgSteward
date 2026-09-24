@@ -11,12 +11,12 @@ use pgsteward_core::auth::ClientCredentials;
 use pgsteward_core::budget::{InstanceBudget, TotalBudget};
 use pgsteward_core::cancel::{CancelRegistry, ProxyTag, forward_cancel};
 use pgsteward_core::console::{
-    ConsoleView, InstanceSnapshot, PoolSnapshot, is_console, serve_console,
+    ConsoleNode, ConsoleView, InstanceSnapshot, PoolSnapshot, is_console, serve_console,
 };
 use pgsteward_core::convergence::ProxyPools;
 use pgsteward_core::grant::InProcessCoordinator;
 use pgsteward_core::inspect::{InspectError, count_foreign_connections, read_server_limits};
-use pgsteward_core::policy::Policies;
+use pgsteward_core::policy::{PolicyChange, SettingError};
 use pgsteward_core::pool::{InstanceOpener, Pool, PoolLimits};
 use pgsteward_core::relay::transaction_mode;
 use pgsteward_core::rt::{JoinHandle, Listener, Runtime};
@@ -208,7 +208,6 @@ pub async fn serve<R: Runtime>(
         credentials: Arc::new(node.client_credentials()?),
         tls: node.client_tls()?.map(Arc::new),
         server_tls,
-        policies: Arc::new(policies),
         addresses: Arc::new(addresses),
         node: Arc::new(node),
         pools: Arc::clone(&pools),
@@ -391,7 +390,6 @@ struct Front<R: Runtime> {
     credentials: Arc<ClientCredentials>,
     tls: Option<Arc<ClientTls>>,
     server_tls: Arc<ServerTls>,
-    policies: Arc<Policies>,
     addresses: Arc<BTreeMap<InstanceId, String>>,
     node: Arc<NodeConfig>,
     pools: Arc<NodePools<R>>,
@@ -411,7 +409,6 @@ impl<R: Runtime> Clone for Front<R> {
             credentials: Arc::clone(&self.credentials),
             tls: self.tls.clone(),
             server_tls: Arc::clone(&self.server_tls),
-            policies: Arc::clone(&self.policies),
             addresses: Arc::clone(&self.addresses),
             node: Arc::clone(&self.node),
             pools: Arc::clone(&self.pools),
@@ -456,14 +453,16 @@ impl<R: Runtime> Front<R> {
         };
         let tenant = session.tenant().clone();
         if is_console(&tenant) {
-            if let Err(error) = serve_console(session, || self.console_view()).await {
+            let console = self.clone();
+            if let Err(error) = serve_console(session, console).await {
                 tracing::warn!(%tenant, %error, "an admin console session ended with an error");
             }
             drop(admitted);
             return;
         }
         let Some(instance) = self
-            .policies
+            .coordinator
+            .policies()
             .route(&tenant, |total| rand::random_range(0..total))
             .cloned()
         else {
@@ -500,29 +499,6 @@ impl<R: Runtime> Front<R> {
         }
     }
 
-    /// One reading of everything the console reports. Nothing in it is read
-    /// again while a table is written, so a table never mixes two states of
-    /// the node.
-    fn console_view(&self) -> ConsoleView {
-        ConsoleView {
-            proxy: self.proxy.clone(),
-            pool_mode: self.pool_mode.to_owned(),
-            pools: self
-                .pools
-                .stats()
-                .into_iter()
-                .map(|(instance, tenant, stats)| PoolSnapshot {
-                    policy: self.policies.policy(&instance, &tenant),
-                    instance,
-                    tenant,
-                    stats,
-                })
-                .collect(),
-            instances: self.derived.snapshot(),
-            table: self.coordinator.table(),
-        }
-    }
-
     fn open(&self, instance: &InstanceId, tenant: &TenantId) -> Pool<InstanceOpener<R>, R> {
         Pool::new(
             InstanceOpener::new(
@@ -538,6 +514,36 @@ impl<R: Runtime> Front<R> {
                 wait_timeout: self.wait_timeout,
             },
         )
+    }
+}
+
+/// The console reads this node through the coordinator, which holds the
+/// cluster configuration this stage allocates against, and writes settings
+/// back to the same place.
+impl<R: Runtime> ConsoleNode for Front<R> {
+    fn view(&self) -> ConsoleView {
+        let policies = self.coordinator.policies();
+        ConsoleView {
+            proxy: self.proxy.clone(),
+            pool_mode: self.pool_mode.to_owned(),
+            pools: self
+                .pools
+                .stats()
+                .into_iter()
+                .map(|(instance, tenant, stats)| PoolSnapshot {
+                    policy: policies.policy(&instance, &tenant),
+                    instance,
+                    tenant,
+                    stats,
+                })
+                .collect(),
+            instances: self.derived.snapshot(),
+            table: self.coordinator.table(),
+        }
+    }
+
+    fn set_tenant(&self, tenant: &str, change: PolicyChange) -> Result<(), SettingError> {
+        self.coordinator.set_tenant(tenant, change)
     }
 }
 

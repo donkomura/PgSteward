@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 
 use bytes::BytesMut;
-use pgsteward_protocol::admin::{AdminCommand, parse};
+use pgsteward_protocol::admin::{AdminCommand, TenantSettings, parse};
 use pgsteward_protocol::backend::{
     Column, ErrorResponse, encode_command_complete, encode_data_row, encode_empty_query_response,
     encode_error_response, encode_parameter_status, encode_ready_for_query, encode_row_description,
@@ -17,6 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::allocation::{AllocationTable, Holder, InstanceId, ProxyId};
 use crate::budget::TotalBudget;
 use crate::grant::TenantPolicy;
+use crate::policy::{PolicyChange, SettingError};
 use crate::pool::PoolStats;
 use crate::session::ClientSession;
 use crate::tenant::TenantId;
@@ -25,6 +26,10 @@ use crate::tenant::TenantId;
 /// PostgreSQL answers a `SHOW`.
 const TAG: &str = "SHOW";
 
+/// What a written setting reports as its command tag, the way PostgreSQL
+/// answers a `SET`.
+const SET_TAG: &str = "SET";
+
 /// The database a client names to reach the admin console instead of an
 /// instance. It is reserved: a tenant rule that names it is never consulted,
 /// so the console is reachable on every node without configuring it.
@@ -32,7 +37,7 @@ pub const DATABASE: &str = "pgsteward";
 
 /// What this node answers today. The console's language is wider than this,
 /// and every refusal points back at the part that is served.
-const SERVED: &str = "This node serves SHOW POOLS, SHOW BUDGET and SHOW INSTANCES.";
+const SERVED: &str = "This node serves SHOW POOLS, SHOW BUDGET, SHOW INSTANCES and SET TENANT.";
 
 /// What the console tells about itself before it reads a command.
 ///
@@ -65,6 +70,17 @@ pub enum ConsoleError {
     Frontend(#[from] FrontendError),
 }
 
+/// The node the console runs in, as far as the console sees it: one reading of
+/// everything the tables report, and the cluster settings the commands write.
+pub trait ConsoleNode: Send + Sync {
+    /// One reading of the node. Nothing in it is read again while a table is
+    /// written, so a table never mixes two states of the node.
+    fn view(&self) -> ConsoleView;
+
+    /// Writes one tenant rule of the cluster configuration.
+    fn set_tenant(&self, tenant: &str, change: PolicyChange) -> Result<(), SettingError>;
+}
+
 /// Whether this client asked for the admin console rather than for an
 /// instance. The database alone decides it, so an operator reaches the console
 /// with whatever login the node already authenticates.
@@ -77,10 +93,10 @@ pub fn is_console(tenant: &TenantId) -> bool {
 ///
 /// The session holds no server connection and takes no slot: it reads `view`
 /// once per command and writes the table from that one reading.
-pub async fn serve_console<S, V>(session: ClientSession<S>, view: V) -> Result<(), ConsoleError>
+pub async fn serve_console<S, N>(session: ClientSession<S>, node: N) -> Result<(), ConsoleError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    V: Fn() -> ConsoleView,
+    N: ConsoleNode,
 {
     let (mut stream, mut pending) = session.into_parts();
     let mut greeting = BytesMut::new();
@@ -106,7 +122,7 @@ where
                 }
                 _ if discarding => {}
                 FrontendTag::Query => {
-                    answer(decode_query(&frame.body)?, &view, &mut out);
+                    answer(decode_query(&frame.body)?, &node, &mut out);
                     encode_ready_for_query(TransactionStatus::Idle, &mut out);
                 }
                 _ => {
@@ -127,7 +143,7 @@ where
 }
 
 /// Writes the table `sql` asks for, or says why it cannot be answered.
-fn answer<V: Fn() -> ConsoleView>(sql: &str, view: &V, out: &mut BytesMut) {
+fn answer<N: ConsoleNode>(sql: &str, node: &N, out: &mut BytesMut) {
     let command = match parse(sql) {
         Ok(command) => command,
         Err(error) => {
@@ -141,15 +157,22 @@ fn answer<V: Fn() -> ConsoleView>(sql: &str, view: &V, out: &mut BytesMut) {
             return;
         }
         AdminCommand::ShowPools => {
-            show_pools(&view()).encode(out);
+            show_pools(&node.view()).encode(out);
             return;
         }
         AdminCommand::ShowBudget => {
-            show_budget(&view()).encode(out);
+            show_budget(&node.view()).encode(out);
             return;
         }
         AdminCommand::ShowInstances => {
-            show_instances(&view()).encode(out);
+            show_instances(&node.view()).encode(out);
+            return;
+        }
+        AdminCommand::SetTenant { tenant, settings } => {
+            match node.set_tenant(&tenant, change_of(settings)) {
+                Ok(()) => encode_command_complete(SET_TAG, out),
+                Err(error) => encode_error_response(&refusal(&error), out),
+            }
             return;
         }
         AdminCommand::ShowClients => "SHOW CLIENTS",
@@ -159,7 +182,6 @@ fn answer<V: Fn() -> ConsoleView>(sql: &str, view: &V, out: &mut BytesMut) {
         AdminCommand::Pause => "PAUSE",
         AdminCommand::Resume => "RESUME",
         AdminCommand::SetInstance { .. } => "SET INSTANCE",
-        AdminCommand::SetTenant { .. } => "SET TENANT",
     };
     encode_error_response(
         &ErrorResponse::error(
@@ -171,6 +193,42 @@ fn answer<V: Fn() -> ConsoleView>(sql: &str, view: &V, out: &mut BytesMut) {
         .with_hint(SERVED),
         out,
     );
+}
+
+fn change_of(settings: TenantSettings) -> PolicyChange {
+    PolicyChange {
+        min: settings.min,
+        max: settings.max,
+        weight: settings.weight,
+    }
+}
+
+/// What the console sends back when the node will not take a setting.
+///
+/// A name no rule is written as is an object that does not exist; a value the
+/// allocation could not stand behind is a parameter out of range. Each refusal
+/// points at where the operator can read the numbers it was weighed against.
+fn refusal(error: &SettingError) -> ErrorResponse {
+    let (code, hint) = match error {
+        SettingError::NoSuchTenant { .. } => (
+            sqlstate::UNDEFINED_OBJECT,
+            "The name is a tenant rule as the cluster configuration writes it, \
+             for example `app_web@reports`, `app_web` or `*`.",
+        ),
+        SettingError::MinAboveMax { .. } => (
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "Write min and max in one command to move both at once.",
+        ),
+        SettingError::ZeroWeight => (
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "A weight is at least 1, which is the value a rule holds unless it says otherwise.",
+        ),
+        SettingError::AboveBudget { .. } => (
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "SHOW INSTANCES explains how each total budget was derived.",
+        ),
+    };
+    ErrorResponse::error(code, error.to_string()).with_hint(hint)
 }
 
 /// The console reads whole commands, so it has nowhere to put a parse that is

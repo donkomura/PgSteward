@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use crate::allocation::{
     AllocationTable, Desired, Entry, Holder, InstanceId, PreconditionError, ProxyId,
 };
-use crate::policy::Policies;
+use crate::policy::{Policies, PolicyChange, SettingError};
 use crate::rt::Clock;
 use crate::tenant::TenantId;
 
@@ -155,6 +155,28 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
 
     pub fn set_policies(&self, policies: Policies) {
         self.lock().policies = policies;
+    }
+
+    #[must_use]
+    pub fn policies(&self) -> Policies {
+        self.lock().policies.clone()
+    }
+
+    /// Writes one tenant rule of the cluster configuration and recomputes the
+    /// desired state from it, so that a setting an operator wrote is in force
+    /// when the command is answered rather than at the next round.
+    pub fn set_tenant(&self, tenant: &str, change: PolicyChange) -> Result<(), SettingError> {
+        {
+            let mut state = self.lock();
+            let changed = state.policies.change_tenant(tenant, change, |instance| {
+                state.budgets.get(instance).copied()
+            })?;
+            state.policies = changed;
+        }
+        if let Err(error) = self.reconcile() {
+            tracing::error!(%error, "the desired state was rejected by the allocation table");
+        }
+        Ok(())
     }
 
     #[must_use]
