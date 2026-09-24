@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pgsteward_core::allocation::{Holder, InstanceId, ProxyId};
@@ -10,6 +11,7 @@ use pgsteward_core::rt::Instant;
 use pgsteward_core::tenant::TenantId;
 use pgsteward_sched::fair::WeightedMaxMinFair;
 use proptest::prelude::*;
+use tokio::time::timeout;
 
 const WINDOW: Duration = Duration::from_secs(60);
 
@@ -393,6 +395,109 @@ fn an_instance_the_coordinator_does_not_hold_is_not_observed() {
         None
     );
     assert!(coordinator.instances().is_empty());
+}
+
+#[tokio::test]
+async fn a_written_margin_moves_the_budget_that_is_derived_from_it() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+    coordinator.add_instance(primary(), InstanceBudget::new(limits(200), 15, WINDOW));
+
+    coordinator.set_margin(&primary(), 45).await.unwrap();
+
+    let (_, budget) = &coordinator.instances()[0];
+    assert_eq!(budget.inputs().margin, 45);
+    assert_eq!(budget.total(), 150);
+}
+
+#[tokio::test]
+async fn a_margin_that_grows_the_budget_is_in_force_when_the_setting_is_answered() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+    coordinator.add_instance(primary(), InstanceBudget::new(limits(200), 15, WINDOW));
+    coordinator.set_policies(policies(&["alice"], open_policy()));
+    report(&coordinator, &[("alice", 500, 0)]);
+    coordinator.reconcile().unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 180);
+
+    coordinator.set_margin(&primary(), 5).await.unwrap();
+
+    assert_eq!(coordinator.table().budget(&primary()), 190);
+    assert_eq!(granted(&coordinator, "alice"), 190);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_margin_that_shrinks_the_budget_is_answered_after_the_connections_are_gone() {
+    let coordinator = Arc::new(InProcessCoordinator::new(
+        proxy(),
+        WeightedMaxMinFair::default(),
+    ));
+    coordinator.add_instance(primary(), InstanceBudget::new(limits(200), 15, WINDOW));
+    coordinator.set_policies(policies(&["alice"], open_policy()));
+    report(&coordinator, &[("alice", 500, 0)]);
+    coordinator.reconcile().unwrap();
+    report(&coordinator, &[("alice", 500, 180)]);
+
+    let mut writing = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move { coordinator.set_margin(&primary(), 45).await }
+    });
+
+    assert!(
+        timeout(Duration::from_secs(60), &mut writing)
+            .await
+            .is_err(),
+        "the setting is not answered while the proxy still holds the connections"
+    );
+    assert_eq!(
+        granted(&coordinator, "alice"),
+        150,
+        "the desired state is computed within the new budget at once"
+    );
+
+    report(&coordinator, &[("alice", 500, 150)]);
+
+    writing.await.unwrap().unwrap();
+    assert_eq!(coordinator.table().budget(&primary()), 150);
+}
+
+#[tokio::test]
+async fn a_margin_for_an_instance_the_coordinator_does_not_hold_is_refused() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+
+    let error = coordinator.set_margin(&primary(), 20).await.unwrap_err();
+
+    assert_eq!(
+        error,
+        SettingError::NoSuchInstance {
+            instance: primary()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_margin_that_would_put_the_budget_below_the_minimums_is_refused() {
+    let coordinator = InProcessCoordinator::new(proxy(), WeightedMaxMinFair::default());
+    coordinator.add_instance(primary(), InstanceBudget::new(limits(200), 15, WINDOW));
+    coordinator.set_policies(policies(
+        &["alice"],
+        TenantPolicy {
+            min: 100,
+            ..open_policy()
+        },
+    ));
+
+    let error = coordinator.set_margin(&primary(), 150).await.unwrap_err();
+
+    assert_eq!(
+        error,
+        SettingError::AboveBudget {
+            instance: primary(),
+            minimums: 100,
+            budget: 45,
+        }
+    );
+    let (_, budget) = &coordinator.instances()[0];
+    assert_eq!(budget.inputs().margin, 15);
+    assert_eq!(budget.total(), 180);
 }
 
 #[derive(Debug, Clone)]

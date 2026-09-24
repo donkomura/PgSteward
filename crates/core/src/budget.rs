@@ -185,6 +185,23 @@ impl InstanceBudget {
         self.derive()
     }
 
+    pub fn set_margin(&mut self, margin: u32) -> BudgetChange {
+        self.margin = margin;
+        self.derive()
+    }
+
+    /// What the budget would become with `margin` taken off it. A setting is
+    /// weighed against this before it is written, so one that is refused
+    /// leaves the derivation where it was.
+    #[must_use]
+    pub fn with_margin(&self, margin: u32) -> TotalBudget {
+        TotalBudget::derive(BudgetInputs {
+            limits: self.limits,
+            foreign_peak: self.peak.peak(),
+            margin,
+        })
+    }
+
     #[must_use]
     pub fn current(&self) -> TotalBudget {
         self.budget

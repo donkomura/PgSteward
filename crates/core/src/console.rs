@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
 use std::io;
 
 use bytes::BytesMut;
@@ -37,7 +38,8 @@ pub const DATABASE: &str = "pgsteward";
 
 /// What this node answers today. The console's language is wider than this,
 /// and every refusal points back at the part that is served.
-const SERVED: &str = "This node serves SHOW POOLS, SHOW BUDGET, SHOW INSTANCES and SET TENANT.";
+const SERVED: &str =
+    "This node serves SHOW POOLS, SHOW BUDGET, SHOW INSTANCES, SET TENANT and SET INSTANCE.";
 
 /// What the console tells about itself before it reads a command.
 ///
@@ -79,6 +81,17 @@ pub trait ConsoleNode: Send + Sync {
 
     /// Writes one tenant rule of the cluster configuration.
     fn set_tenant(&self, tenant: &str, change: PolicyChange) -> Result<(), SettingError>;
+
+    /// Writes the margin one instance's total budget is derived with.
+    ///
+    /// It answers once the margin is in force, which for a margin that shrinks
+    /// the budget is after the connections above it are closed, so the console
+    /// never reports a budget the instance is not yet within.
+    fn set_instance(
+        &self,
+        instance: &str,
+        margin: u32,
+    ) -> impl Future<Output = Result<(), SettingError>> + Send;
 }
 
 /// Whether this client asked for the admin console rather than for an
@@ -122,7 +135,7 @@ where
                 }
                 _ if discarding => {}
                 FrontendTag::Query => {
-                    answer(decode_query(&frame.body)?, &node, &mut out);
+                    answer(decode_query(&frame.body)?, &node, &mut out).await;
                     encode_ready_for_query(TransactionStatus::Idle, &mut out);
                 }
                 _ => {
@@ -143,7 +156,7 @@ where
 }
 
 /// Writes the table `sql` asks for, or says why it cannot be answered.
-fn answer<N: ConsoleNode>(sql: &str, node: &N, out: &mut BytesMut) {
+async fn answer<N: ConsoleNode>(sql: &str, node: &N, out: &mut BytesMut) {
     let command = match parse(sql) {
         Ok(command) => command,
         Err(error) => {
@@ -175,13 +188,19 @@ fn answer<N: ConsoleNode>(sql: &str, node: &N, out: &mut BytesMut) {
             }
             return;
         }
+        AdminCommand::SetInstance { instance, margin } => {
+            match node.set_instance(&instance, margin).await {
+                Ok(()) => encode_command_complete(SET_TAG, out),
+                Err(error) => encode_error_response(&refusal(&error), out),
+            }
+            return;
+        }
         AdminCommand::ShowClients => "SHOW CLIENTS",
         AdminCommand::ShowServers => "SHOW SERVERS",
         AdminCommand::ShowConfig => "SHOW CONFIG",
         AdminCommand::Reload => "RELOAD",
         AdminCommand::Pause => "PAUSE",
         AdminCommand::Resume => "RESUME",
-        AdminCommand::SetInstance { .. } => "SET INSTANCE",
     };
     encode_error_response(
         &ErrorResponse::error(
@@ -214,6 +233,10 @@ fn refusal(error: &SettingError) -> ErrorResponse {
             sqlstate::UNDEFINED_OBJECT,
             "The name is a tenant rule as the cluster configuration writes it, \
              for example `app_web@reports`, `app_web` or `*`.",
+        ),
+        SettingError::NoSuchInstance { .. } => (
+            sqlstate::UNDEFINED_OBJECT,
+            "SHOW INSTANCES names the instances the cluster configuration holds.",
         ),
         SettingError::MinAboveMax { .. } => (
             sqlstate::INVALID_PARAMETER_VALUE,

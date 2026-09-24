@@ -20,6 +20,8 @@ pub struct PolicyChange {
 pub enum SettingError {
     #[error("the cluster configuration writes no tenant rule named `{tenant}`")]
     NoSuchTenant { tenant: String },
+    #[error("the cluster configuration holds no instance named `{instance}`")]
+    NoSuchInstance { instance: InstanceId },
     #[error("a minimum of {min} is above the maximum of {max}")]
     MinAboveMax { min: u32, max: u32 },
     #[error("a weight of 0 would leave the tenant out of every allocation")]
