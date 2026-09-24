@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
 use pgsteward_core::admission::ClientLimit;
 use pgsteward_core::allocation::{InstanceId, ProxyId};
 use pgsteward_core::auth::ClientCredentials;
-use pgsteward_core::budget::{InstanceBudget, TotalBudget};
+use pgsteward_core::budget::InstanceBudget;
 use pgsteward_core::cancel::{CancelRegistry, ProxyTag, forward_cancel};
 use pgsteward_core::console::{
     ConsoleNode, ConsoleView, InstanceSnapshot, PoolSnapshot, is_console, serve_console,
@@ -150,11 +150,6 @@ pub async fn serve<R: Runtime>(
 
     let mut tasks = Vec::new();
     let mut addresses = BTreeMap::new();
-    let derived = Arc::new(DerivedBudgets::default());
-    let budgets = Budgets {
-        coordinator: Arc::clone(&coordinator),
-        derived: Arc::clone(&derived),
-    };
     for instance in &cluster.instance {
         let observer = Observer::start(
             rt.clone(),
@@ -163,7 +158,7 @@ pub async fn serve<R: Runtime>(
             monitor.clone(),
             Arc::clone(&server_tls),
             options,
-            budgets.clone(),
+            Arc::clone(&coordinator),
         )
         .await?;
         tasks.push(rt.spawn(observer.run()));
@@ -212,7 +207,6 @@ pub async fn serve<R: Runtime>(
         node: Arc::new(node),
         pools: Arc::clone(&pools),
         coordinator: Arc::clone(&coordinator),
-        derived,
         wait_timeout: options.wait_timeout,
     };
     tasks.push(rt.spawn(front.accept(listener)));
@@ -225,7 +219,8 @@ pub async fn serve<R: Runtime>(
     })
 }
 
-/// Keeps one instance's total budget up to date from what the instance reports.
+/// Counts what each instance reports, so that the coordinator can keep the
+/// total budget it derived up to date.
 ///
 /// Its own connection is one this system opened, so the foreign count leaves it
 /// out; it is taken off the budget with the margin instead.
@@ -236,52 +231,8 @@ struct Observer<R: Runtime> {
     credentials: ServerCredentials,
     tls: Arc<ServerTls>,
     interval: Duration,
-    budget: InstanceBudget,
     connection: Option<ServerConnection<MaybeTls<R::Stream>>>,
-    budgets: Budgets,
-}
-
-/// Where an observer publishes the budget it derived: the coordinator
-/// allocates against the number, and the console explains that number from
-/// the parts beside it.
-#[derive(Debug, Clone)]
-struct Budgets {
     coordinator: Arc<Coordinator>,
-    derived: Arc<DerivedBudgets>,
-}
-
-impl Budgets {
-    fn publish(&self, instance: &InstanceId, budget: TotalBudget) {
-        self.coordinator
-            .set_budget(instance.clone(), budget.total());
-        self.derived.set(instance.clone(), budget);
-    }
-}
-
-/// The total budget of each instance together with the parts it was derived
-/// from. The coordinator keeps only the number it allocates against, so the
-/// breakdown the console explains it with is kept here.
-#[derive(Debug, Default)]
-struct DerivedBudgets(Mutex<BTreeMap<InstanceId, TotalBudget>>);
-
-impl DerivedBudgets {
-    fn set(&self, instance: InstanceId, budget: TotalBudget) {
-        self.lock().insert(instance, budget);
-    }
-
-    fn snapshot(&self) -> Vec<InstanceSnapshot> {
-        self.lock()
-            .iter()
-            .map(|(instance, budget)| InstanceSnapshot {
-                instance: instance.clone(),
-                budget: *budget,
-            })
-            .collect()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<InstanceId, TotalBudget>> {
-        self.0.lock().expect("derived budgets lock poisoned")
-    }
 }
 
 impl<R: Runtime> Observer<R> {
@@ -292,7 +243,7 @@ impl<R: Runtime> Observer<R> {
         credentials: ServerCredentials,
         tls: Arc<ServerTls>,
         options: ServeOptions,
-        budgets: Budgets,
+        coordinator: Arc<Coordinator>,
     ) -> Result<Self, ServeError> {
         let mut connection = connect(
             &rt,
@@ -321,7 +272,7 @@ impl<R: Runtime> Observer<R> {
         );
         budget.observe(rt.now(), foreign);
         tracing::info!(%instance, budget = %budget.current(), "derived the total budget");
-        budgets.publish(&instance, budget.current());
+        coordinator.add_instance(instance.clone(), budget);
         Ok(Self {
             rt,
             instance,
@@ -329,9 +280,8 @@ impl<R: Runtime> Observer<R> {
             credentials,
             tls,
             interval: options.observe_interval,
-            budget,
             connection: Some(connection),
-            budgets,
+            coordinator,
         })
     }
 
@@ -340,8 +290,8 @@ impl<R: Runtime> Observer<R> {
             self.rt.sleep(self.interval).await;
             match self.observe().await {
                 Ok(foreign) => {
-                    self.budget.observe(self.rt.now(), foreign);
-                    self.budgets.publish(&self.instance, self.budget.current());
+                    self.coordinator
+                        .observe_instance(&self.instance, self.rt.now(), foreign);
                 }
                 Err(error) => {
                     self.connection = None;
@@ -394,7 +344,6 @@ struct Front<R: Runtime> {
     node: Arc<NodeConfig>,
     pools: Arc<NodePools<R>>,
     coordinator: Arc<Coordinator>,
-    derived: Arc<DerivedBudgets>,
     wait_timeout: Duration,
 }
 
@@ -413,7 +362,6 @@ impl<R: Runtime> Clone for Front<R> {
             node: Arc::clone(&self.node),
             pools: Arc::clone(&self.pools),
             coordinator: Arc::clone(&self.coordinator),
-            derived: Arc::clone(&self.derived),
             wait_timeout: self.wait_timeout,
         }
     }
@@ -537,7 +485,12 @@ impl<R: Runtime> ConsoleNode for Front<R> {
                     stats,
                 })
                 .collect(),
-            instances: self.derived.snapshot(),
+            instances: self
+                .coordinator
+                .instances()
+                .into_iter()
+                .map(|(instance, budget)| InstanceSnapshot { instance, budget })
+                .collect(),
             table: self.coordinator.table(),
         }
     }

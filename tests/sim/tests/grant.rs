@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pgsteward_core::allocation::{InstanceId, ProxyId};
+use pgsteward_core::budget::{InstanceBudget, ServerLimits};
 use pgsteward_core::convergence::ProxyPools;
 use pgsteward_core::grant::{InProcessCoordinator, TenantPolicy};
 use pgsteward_core::policy::{Policies, TenantRule};
@@ -87,7 +88,18 @@ fn compete(seed: u64) {
             ProxyId::new("proxy-1"),
             WeightedMaxMinFair::default(),
         ));
-        coordinator.set_budget(primary(), BUDGET);
+        coordinator.add_instance(
+            primary(),
+            InstanceBudget::new(
+                ServerLimits {
+                    max_connections: BUDGET,
+                    superuser_reserved_connections: 0,
+                    reserved_connections: 0,
+                },
+                0,
+                Duration::from_secs(60),
+            ),
+        );
         coordinator.set_policies(
             Policies::new()
                 .instance(primary(), NonZeroU32::new(1).unwrap())
