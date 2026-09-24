@@ -32,6 +32,7 @@ use pgsteward_sched::fair::WeightedMaxMinFair;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{ClusterConfig, ConfigError, NodeConfig, PoolMode};
+use crate::metrics::serve_scrapes;
 
 const PROXY: &str = "proxy";
 const MONITOR: &str = "monitor";
@@ -87,6 +88,7 @@ type Coordinator = InProcessCoordinator<WeightedMaxMinFair>;
 /// A node that is serving. Dropping it stops every task it started.
 pub struct Serving<R: Runtime> {
     addr: SocketAddr,
+    metrics_addr: Option<SocketAddr>,
     coordinator: Arc<Coordinator>,
     pools: Arc<NodePools<R>>,
     tasks: Vec<JoinHandle<()>>,
@@ -96,6 +98,12 @@ impl<R: Runtime> Serving<R> {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Where a Prometheus scrape reads this node, if it publishes metrics.
+    #[must_use]
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.metrics_addr
     }
 
     #[must_use]
@@ -183,6 +191,7 @@ pub async fn serve<R: Runtime>(
     }));
 
     let listen = node.node.listen;
+    let node_metrics_listen = node.node.metrics_listen;
     let listener = rt
         .bind(&listen.to_string())
         .await
@@ -209,14 +218,46 @@ pub async fn serve<R: Runtime>(
         coordinator: Arc::clone(&coordinator),
         wait_timeout: options.wait_timeout,
     };
+    let metrics_addr = match node_metrics_listen {
+        Some(listen) => Some(publish_metrics(&rt, listen, front.clone(), &mut tasks).await?),
+        None => None,
+    };
     tasks.push(rt.spawn(front.accept(listener)));
 
     Ok(Serving {
         addr,
+        metrics_addr,
         coordinator,
         pools,
         tasks,
     })
+}
+
+/// Opens the listener a Prometheus scrape reads this node on.
+///
+/// It is a listener of its own rather than a path on the one clients connect
+/// to: what the metrics reach is a deployment's choice, and a scraper has no
+/// business speaking the wire protocol to get them.
+async fn publish_metrics<R: Runtime>(
+    rt: &R,
+    listen: SocketAddr,
+    front: Front<R>,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> Result<SocketAddr, ServeError> {
+    let listener = rt
+        .bind(&listen.to_string())
+        .await
+        .map_err(|source| ServeError::Listen {
+            addr: listen,
+            source,
+        })?;
+    let addr = listener.local_addr().map_err(|source| ServeError::Listen {
+        addr: listen,
+        source,
+    })?;
+    tasks.push(rt.spawn(serve_scrapes(rt.clone(), listener, front)));
+    tracing::info!(%addr, "publishing metrics");
+    Ok(addr)
 }
 
 /// Counts what each instance reports, so that the coordinator can keep the

@@ -93,6 +93,11 @@ pub struct NodeSection {
     pub listen: SocketAddr,
     pub coordinator: String,
     pub max_client_connections: u32,
+    /// Where a Prometheus scrape reads this node's metrics. A node that names
+    /// no address publishes none: the listener is separate from the one
+    /// clients connect to, so that what the metrics reach is a deployment's
+    /// choice rather than this system's.
+    pub metrics_listen: Option<SocketAddr>,
     pub tls: Option<TlsSection>,
     pub server_tls: Option<ServerTlsSection>,
 }

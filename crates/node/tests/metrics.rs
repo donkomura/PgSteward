@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -8,11 +9,11 @@ use pgsteward_core::allocation::{AllocationTable, Desired, Entry, Holder, Instan
 use pgsteward_core::budget::{BudgetInputs, ServerLimits, TotalBudget};
 use pgsteward_core::console::{ConsoleNode, ConsoleView, InstanceSnapshot, PoolSnapshot};
 use pgsteward_core::grant::TenantPolicy;
-use pgsteward_core::pool::PoolStats;
-use pgsteward_core::tenant::TenantId;
 use pgsteward_core::policy::{PolicyChange, SettingError};
+use pgsteward_core::pool::PoolStats;
+use pgsteward_core::rt::Net;
 use pgsteward_core::rt::tokio_rt::TokioRuntime;
-use pgsteward_core::rt::{Listener, Net};
+use pgsteward_core::tenant::TenantId;
 use pgsteward_node::metrics::{exposition, serve_scrapes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -88,10 +89,7 @@ fn one_pool() -> ConsoleView {
             instance(),
             Desired::new(70)
                 .grant(Holder::new(tenant("app_web"), ProxyId::new(PROXY)), 6)
-                .grant(
-                    Holder::new(tenant("batch"), ProxyId::new(OTHER_PROXY)),
-                    4,
-                ),
+                .grant(Holder::new(tenant("batch"), ProxyId::new(OTHER_PROXY)), 4),
         ),
     );
     view(
@@ -400,8 +398,15 @@ impl ConsoleNode for ScrapedNode {
         unreachable!("a scrape writes nothing")
     }
 
-    async fn set_instance(&self, _instance: &str, _margin: u32) -> Result<(), SettingError> {
-        unreachable!("a scrape writes nothing")
+    fn set_instance(
+        &self,
+        _instance: &str,
+        _margin: u32,
+    ) -> impl Future<Output = Result<(), SettingError>> + Send {
+        let refusal = Err(SettingError::NoSuchInstance {
+            instance: InstanceId::new("a scrape writes nothing"),
+        });
+        async move { refusal }
     }
 }
 
