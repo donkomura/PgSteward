@@ -581,3 +581,24 @@ fn server_tls(mode: &str, root: Option<&std::path::Path>) -> String {
     });
     format!("{NODE_LOCAL}\n[node.server_tls]\nmode = \"{mode}\"\n{root}")
 }
+
+#[test]
+fn a_node_that_writes_no_scrape_address_publishes_no_metrics() {
+    let config = NodeConfig::parse(NODE_LOCAL).unwrap();
+
+    assert_eq!(config.node.metrics_listen, None);
+}
+
+#[test]
+fn the_scrape_address_is_a_node_local_setting() {
+    let config = NodeConfig::parse(&NODE_LOCAL.replace(
+        "max_client_connections = 5000",
+        "max_client_connections = 5000\nmetrics_listen = \"0.0.0.0:9187\"",
+    ))
+    .expect("a node-local config that names where metrics are scraped");
+
+    assert_eq!(
+        config.node.metrics_listen.map(|addr| addr.port()),
+        Some(9187)
+    );
+}
