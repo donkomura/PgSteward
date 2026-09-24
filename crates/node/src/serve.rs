@@ -221,9 +221,6 @@ pub async fn serve<R: Runtime>(
 
 /// Counts what each instance reports, so that the coordinator can keep the
 /// total budget it derived up to date.
-///
-/// Its own connection is one this system opened, so the foreign count leaves it
-/// out; it is taken off the budget with the margin instead.
 struct Observer<R: Runtime> {
     rt: R,
     instance: InstanceId,
@@ -265,12 +262,8 @@ impl<R: Runtime> Observer<R> {
         let foreign = count_foreign_connections(&mut connection)
             .await
             .map_err(inspect)?;
-        let mut budget = InstanceBudget::new(
-            limits,
-            options.margin.saturating_add(1),
-            options.foreign_window,
-        );
-        budget.observe(rt.now(), foreign);
+        let mut budget = InstanceBudget::new(limits, options.margin, options.foreign_window);
+        budget.observe(rt.now(), including_the_observer(foreign));
         tracing::info!(%instance, budget = %budget.current(), "derived the total budget");
         coordinator.add_instance(instance.clone(), budget);
         Ok(Self {
@@ -290,8 +283,11 @@ impl<R: Runtime> Observer<R> {
             self.rt.sleep(self.interval).await;
             match self.observe().await {
                 Ok(foreign) => {
-                    self.coordinator
-                        .observe_instance(&self.instance, self.rt.now(), foreign);
+                    self.coordinator.observe_instance(
+                        &self.instance,
+                        self.rt.now(),
+                        including_the_observer(foreign),
+                    );
                 }
                 Err(error) => {
                     self.connection = None;
@@ -329,6 +325,15 @@ impl<R: Runtime> Observer<R> {
                 source,
             })
     }
+}
+
+/// The observer's own connection carries this system's application name, so
+/// the foreign count leaves it out. No pool holds it either, so it is counted
+/// here rather than taken off the budget with the margin: the margin is a
+/// setting an operator writes and reads back, and it would no longer be the
+/// number they wrote.
+fn including_the_observer(foreign: u32) -> u32 {
+    foreign.saturating_add(1)
 }
 
 struct Front<R: Runtime> {
@@ -497,6 +502,12 @@ impl<R: Runtime> ConsoleNode for Front<R> {
 
     fn set_tenant(&self, tenant: &str, change: PolicyChange) -> Result<(), SettingError> {
         self.coordinator.set_tenant(tenant, change)
+    }
+
+    async fn set_instance(&self, instance: &str, margin: u32) -> Result<(), SettingError> {
+        self.coordinator
+            .set_margin(&InstanceId::new(instance), margin)
+            .await
     }
 }
 

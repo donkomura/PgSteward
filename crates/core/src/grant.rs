@@ -115,6 +115,10 @@ pub struct InProcessCoordinator<A> {
     allocator: A,
     state: Mutex<State>,
     grants: watch::Sender<GrantSet>,
+    /// Ticks once per report. A setting that waits for the proxies to
+    /// converge is woken by it, since a report is the only thing that tells
+    /// the coordinator a connection is gone.
+    reports: watch::Sender<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -142,11 +146,13 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
     #[must_use]
     pub fn new(proxy: ProxyId, allocator: A) -> Self {
         let (grants, _) = watch::channel(GrantSet::default());
+        let (reports, _) = watch::channel(0);
         Self {
             proxy,
             allocator,
             state: Mutex::new(State::default()),
             grants,
+            reports,
         }
     }
 
@@ -211,6 +217,68 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
             tracing::error!(%error, "the desired state was rejected by the allocation table");
         }
         Ok(())
+    }
+
+    /// Writes the margin an instance's total budget is derived with, and
+    /// answers once that budget is in force.
+    ///
+    /// A margin that grows the budget is in force as soon as the desired state
+    /// has been computed from it. A margin that shrinks it is not: until the
+    /// proxies have closed what they hold above the new budget, the instance
+    /// carries more connections than the setting allows, so the answer waits
+    /// for them to report the excess gone.
+    pub async fn set_margin(&self, instance: &InstanceId, margin: u32) -> Result<(), SettingError> {
+        let change = {
+            let mut state = self.lock();
+            let budget =
+                state
+                    .budgets
+                    .get(instance)
+                    .ok_or_else(|| SettingError::NoSuchInstance {
+                        instance: instance.clone(),
+                    })?;
+            let derived = budget.with_margin(margin).total();
+            let minimums = state.policies.minimums_on(instance);
+            if minimums > derived {
+                return Err(SettingError::AboveBudget {
+                    instance: instance.clone(),
+                    minimums,
+                    budget: derived,
+                });
+            }
+            state
+                .budgets
+                .get_mut(instance)
+                .expect("the budget was found above")
+                .set_margin(margin)
+        };
+        if let Err(error) = self.reconcile() {
+            tracing::error!(%error, "the desired state was rejected by the allocation table");
+        }
+        if matches!(change, BudgetChange::Shrank { .. }) {
+            self.converged(instance).await;
+        }
+        Ok(())
+    }
+
+    /// Returns once no more connections can be held on `instance` than its
+    /// budget allows.
+    async fn converged(&self, instance: &InstanceId) {
+        let mut reports = self.reports.subscribe();
+        while !self.within_budget(instance) {
+            if reports.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn within_budget(&self, instance: &InstanceId) -> bool {
+        let state = self.lock();
+        let budget = state
+            .budgets
+            .get(instance)
+            .map_or(0, |budget| budget.current().total());
+        state.occupied_on(instance) <= budget
     }
 
     #[must_use]
@@ -344,6 +412,14 @@ impl State {
             .get(&(instance.clone(), tenant.clone()))
             .map_or(0, |held| held.occupied)
     }
+
+    fn occupied_on(&self, instance: &InstanceId) -> u32 {
+        self.held
+            .iter()
+            .filter(|((of, _), _)| of == instance)
+            .map(|(_, held)| held.occupied)
+            .fold(0, u32::saturating_add)
+    }
 }
 
 impl<A: Allocator<Holder> + Send + Sync> GrantChannel for InProcessCoordinator<A> {
@@ -369,5 +445,8 @@ impl<A: Allocator<Holder> + Send + Sync> GrantChannel for InProcessCoordinator<A
         state
             .held
             .retain(|slot, held| held.occupied > 0 || granted.contains_key(slot));
+        drop(state);
+        self.reports
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 }
