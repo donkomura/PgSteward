@@ -31,8 +31,27 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("reading {}", args.cluster.display()))?;
     let serving = serve(TokioRuntime::new(), node, cluster, ServeOptions::default()).await?;
     tracing::info!(addr = %serving.local_addr(), "serving");
-    tokio::signal::ctrl_c().await?;
+    stop_signal().await?;
+    let stopped = serving.shutdown().await;
+    tracing::info!(closed = stopped.closed, held = stopped.held, "stopped");
     Ok(())
+}
+
+/// Waits for the signal an orchestrator sends to take this node out of
+/// service, so that the grants go back before the process ends rather than
+/// being left to expire.
+#[cfg(unix)]
+async fn stop_signal() -> anyhow::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = terminate.recv() => Ok(()),
+        result = tokio::signal::ctrl_c() => result.map_err(anyhow::Error::from),
+    }
+}
+
+#[cfg(not(unix))]
+async fn stop_signal() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c().await.map_err(anyhow::Error::from)
 }
 
 fn read(path: &PathBuf) -> anyhow::Result<String> {

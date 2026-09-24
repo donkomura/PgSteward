@@ -45,6 +45,7 @@ pub struct ServeOptions {
     pub foreign_window: Duration,
     pub observe_interval: Duration,
     pub wait_timeout: Duration,
+    pub shutdown_grace: Duration,
 }
 
 impl Default for ServeOptions {
@@ -54,6 +55,7 @@ impl Default for ServeOptions {
             foreign_window: Duration::from_secs(60),
             observe_interval: Duration::from_secs(1),
             wait_timeout: Duration::from_secs(30),
+            shutdown_grace: Duration::from_secs(15),
         }
     }
 }
@@ -85,12 +87,25 @@ pub enum ServeError {
 type NodePools<R> = ProxyPools<InstanceOpener<R>, R>;
 type Coordinator = InProcessCoordinator<WeightedMaxMinFair>;
 
+/// What stopping a node left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stopped {
+    /// The server connections the node closed on its way out.
+    pub closed: usize,
+    /// The server connections a client was still using when the grace ended.
+    pub held: usize,
+}
+
 /// A node that is serving. Dropping it stops every task it started.
 pub struct Serving<R: Runtime> {
+    rt: R,
     addr: SocketAddr,
     metrics_addr: Option<SocketAddr>,
+    limit: ClientLimit,
+    grace: Duration,
     coordinator: Arc<Coordinator>,
     pools: Arc<NodePools<R>>,
+    accepting: JoinHandle<()>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -115,10 +130,63 @@ impl<R: Runtime> Serving<R> {
     pub fn pool_count(&self) -> usize {
         self.pools.len()
     }
+
+    /// How many slots this node is granted on `instance` right now.
+    #[must_use]
+    pub fn granted(&self, instance: &InstanceId) -> u32 {
+        self.coordinator.table().granted_total(instance)
+    }
+
+    /// Stops this node: it takes no further client, waits for the sessions it
+    /// still holds until the grace period ends, closes the server connections
+    /// that came back, and gives its grants back once the instances hold
+    /// nothing of its.
+    ///
+    /// A transaction that is still running when the grace ends is not cut off,
+    /// and the slot behind the connection it holds is not given back. A grant
+    /// handed back is a slot another holder may open into, so giving one back
+    /// while this node still holds its connection would put the instance over
+    /// its total budget.
+    ///
+    /// The control loops stop first: a node on its way out asks for nothing
+    /// more, and every connection it closes from here is closed by the stop
+    /// itself, in one place.
+    pub async fn shutdown(&self) -> Stopped {
+        self.accepting.abort();
+        for task in &self.tasks {
+            task.abort();
+        }
+        tracing::info!("stopping: this node takes no further client");
+        tokio::select! {
+            () = self.limit.drained() => {
+                tracing::info!("stopping: every client session has ended");
+            }
+            () = self.rt.sleep(self.grace) => {
+                tracing::info!(
+                    clients = self.limit.live(),
+                    "stopping: the grace ended with clients still being served"
+                );
+            }
+        }
+        let closed = self.pools.drain().await;
+        let held = self.pools.occupied();
+        if held == 0 {
+            self.coordinator.withdraw();
+            tracing::info!(closed, "stopped: every grant is back with its instance");
+        } else {
+            tracing::warn!(
+                closed,
+                held,
+                "stopped: the grants of the connections still in use are left to expire"
+            );
+        }
+        Stopped { closed, held }
+    }
 }
 
 impl<R: Runtime> Drop for Serving<R> {
     fn drop(&mut self) {
+        self.accepting.abort();
         for task in &self.tasks {
             task.abort();
         }
@@ -203,12 +271,13 @@ pub async fn serve<R: Runtime>(
         addr: listen,
         source,
     })?;
+    let limit = node.client_limit();
     let front = Front {
         rt: rt.clone(),
         proxy: proxy.clone(),
         pool_mode: cluster.cluster.pool_mode.as_str(),
         cancels: CancelRegistry::new(ProxyTag::of(&proxy)),
-        limit: node.client_limit(),
+        limit: limit.clone(),
         credentials: Arc::new(node.client_credentials()?),
         tls: node.client_tls()?.map(Arc::new),
         server_tls,
@@ -222,13 +291,17 @@ pub async fn serve<R: Runtime>(
         Some(listen) => Some(publish_metrics(&rt, listen, front.clone(), &mut tasks).await?),
         None => None,
     };
-    tasks.push(rt.spawn(front.accept(listener)));
+    let accepting = rt.spawn(front.accept(listener));
 
     Ok(Serving {
+        rt,
         addr,
         metrics_addr,
+        limit,
+        grace: options.shutdown_grace,
         coordinator,
         pools,
+        accepting,
         tasks,
     })
 }

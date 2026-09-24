@@ -679,3 +679,35 @@ fn a_refused_tenant_setting_leaves_the_rule_that_was_in_force() {
     assert_eq!(coordinator.policies().rule("alice").unwrap().policy.min, 0);
     assert_eq!(granted(&coordinator, "alice"), 8);
 }
+
+#[test]
+fn a_proxy_that_gave_its_grants_back_holds_none() {
+    let coordinator = coordinator(10, &["alice"]);
+    report(&coordinator, &[("alice", 3, 3)]);
+    coordinator.reconcile().unwrap();
+    let before = generation(&coordinator);
+
+    coordinator.withdraw();
+
+    assert_eq!(granted(&coordinator, "alice"), 0);
+    assert_eq!(coordinator.table().holders(&primary()).count(), 0);
+    assert_eq!(coordinator.table().headroom(&primary()), 10);
+    assert!(
+        generation(&coordinator) > before,
+        "the proxy learns that it holds nothing"
+    );
+}
+
+#[test]
+fn a_proxy_that_gave_its_grants_back_is_granted_nothing_again() {
+    let coordinator = coordinator(10, &["alice"]);
+    report(&coordinator, &[("alice", 3, 3)]);
+    coordinator.reconcile().unwrap();
+    coordinator.withdraw();
+
+    report(&coordinator, &[("alice", 5, 0)]);
+    coordinator.reconcile().unwrap();
+
+    assert_eq!(granted(&coordinator, "alice"), 0);
+    assert_eq!(coordinator.table().holders(&primary()).count(), 0);
+}

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use pgsteward_core::admission::{Admitted, ClientLimit};
@@ -12,6 +14,7 @@ use pgsteward_protocol::startup::{
 };
 use postgres_protocol::message::backend::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+use tokio::time::timeout;
 
 const MAX_FRAME: usize = 1 << 20;
 const DUPLEX_CAPACITY: usize = 64 * 1024;
@@ -185,6 +188,34 @@ async fn clients_arriving_at_once_never_pass_the_limit() {
 
     admitted.clear();
     assert_eq!(limit.live(), 0);
+}
+
+#[tokio::test]
+async fn a_node_that_holds_no_client_is_drained_at_once() {
+    let limit = ClientLimit::new(4);
+
+    timeout(Duration::from_secs(1), limit.drained())
+        .await
+        .expect("nothing is here to wait for");
+}
+
+#[tokio::test]
+async fn draining_waits_for_the_client_that_is_still_here() {
+    let limit = ClientLimit::new(4);
+    let place = limit.admit().expect("a place under the limit");
+    let drained = tokio::spawn({
+        let limit = limit.clone();
+        async move { limit.drained().await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!drained.is_finished(), "one client still holds a place");
+
+    drop(place);
+
+    timeout(Duration::from_secs(1), drained)
+        .await
+        .expect("the last client left")
+        .unwrap();
 }
 
 #[derive(Debug, Clone)]
