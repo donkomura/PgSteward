@@ -101,6 +101,16 @@ impl<O: OpenServer, K: Clock> ProxyPools<O, K> {
         )
     }
 
+    /// How many connections the instances hold for this proxy right now,
+    /// counting the ones still opening.
+    #[must_use]
+    pub fn occupied(&self) -> usize {
+        self.lock()
+            .values()
+            .map(|entry| entry.pool.stats().occupied())
+            .sum()
+    }
+
     /// What every pool holds right now, for the admin console to read.
     #[must_use]
     pub fn stats(&self) -> Vec<(InstanceId, TenantId, PoolStats)> {
@@ -138,6 +148,15 @@ where
             grants.get(instance, tenant) > 0 || !entry.pool.is_unused()
         });
         closed
+    }
+
+    /// Closes everything the pools hold, whatever they were granted, and
+    /// answers how many connections that closed.
+    ///
+    /// A connection a client is still using is not taken away from it, so what
+    /// is left afterwards is what [`ProxyPools::occupied`] answers.
+    pub async fn drain(&self) -> usize {
+        self.converge(&GrantSet::default()).await
     }
 
     /// Converges to the latest grants and reports what that left, whenever the

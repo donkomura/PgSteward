@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
 
 use crate::auth::Credentials;
 use crate::session::{AcceptError, Accepted, accept, refuse_over_limit};
@@ -14,7 +14,7 @@ use crate::tls::{ClientTls, MaybeTls};
 #[derive(Debug, Clone)]
 pub struct ClientLimit {
     max: usize,
-    live: Arc<AtomicUsize>,
+    live: Arc<watch::Sender<usize>>,
 }
 
 impl ClientLimit {
@@ -22,7 +22,7 @@ impl ClientLimit {
     pub fn new(max: usize) -> Self {
         Self {
             max,
-            live: Arc::new(AtomicUsize::new(0)),
+            live: Arc::new(watch::Sender::new(0)),
         }
     }
 
@@ -33,28 +33,34 @@ impl ClientLimit {
 
     #[must_use]
     pub fn live(&self) -> usize {
-        self.live.load(Ordering::SeqCst)
+        *self.live.borrow()
     }
 
     #[must_use]
     pub fn admit(&self) -> Option<Admitted> {
-        let mut live = self.live.load(Ordering::SeqCst);
-        loop {
-            if live >= self.max {
-                return None;
+        let mut taken = false;
+        self.live.send_if_modified(|live| {
+            if *live >= self.max {
+                return false;
             }
-            match self.live.compare_exchange_weak(
-                live,
-                live + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    return Some(Admitted {
-                        live: Arc::clone(&self.live),
-                    });
-                }
-                Err(current) => live = current,
+            *live += 1;
+            taken = true;
+            true
+        });
+        taken.then(|| Admitted {
+            live: Arc::clone(&self.live),
+        })
+    }
+
+    /// Returns once this node holds no client connection.
+    ///
+    /// A node that is stopping waits here: a client that is still being served
+    /// holds a place until its session ends, whichever way it ends.
+    pub async fn drained(&self) {
+        let mut live = self.live.subscribe();
+        while *live.borrow_and_update() > 0 {
+            if live.changed().await.is_err() {
+                return;
             }
         }
     }
@@ -75,11 +81,11 @@ impl ClientLimit {
 /// The place one client connection holds, given back when it is dropped.
 #[derive(Debug)]
 pub struct Admitted {
-    live: Arc<AtomicUsize>,
+    live: Arc<watch::Sender<usize>>,
 }
 
 impl Drop for Admitted {
     fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::SeqCst);
+        self.live.send_modify(|live| *live -= 1);
     }
 }

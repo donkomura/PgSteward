@@ -129,6 +129,7 @@ struct State {
     demand: BTreeMap<Slot, u32>,
     held: BTreeMap<Slot, Held>,
     generation: u64,
+    departed: bool,
 }
 
 /// How many connections a holder may still have on the instance.
@@ -281,6 +282,25 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         state.occupied_on(instance) <= budget
     }
 
+    /// Gives every grant this proxy holds back to its instances, and leaves it
+    /// granted nothing from then on.
+    ///
+    /// A proxy that is stopping calls it once the connections behind those
+    /// grants are closed. From this moment the slots are free for another
+    /// holder to open into, so a proxy that still held its connections would
+    /// put the instance over its total budget.
+    pub fn withdraw(&self) {
+        {
+            let mut state = self.lock();
+            state.departed = true;
+            state.demand.clear();
+            state.held.clear();
+        }
+        if let Err(error) = self.reconcile() {
+            tracing::error!(%error, "the desired state was rejected by the allocation table");
+        }
+    }
+
     #[must_use]
     pub fn table(&self) -> AllocationTable {
         self.lock().table.clone()
@@ -329,6 +349,10 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         let mut entry = Entry::new();
         for (instance, derived) in &state.budgets {
             let budget = derived.current().total();
+            if state.departed {
+                entry = entry.instance(instance.clone(), Desired::new(budget));
+                continue;
+            }
             let tenants: BTreeSet<&TenantId> = state
                 .demand
                 .keys()

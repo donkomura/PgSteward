@@ -139,12 +139,18 @@ async fn a_node_that_stops_closes_its_connections_and_gives_the_grants_back() {
     .await
     .unwrap();
     let tenant = through(serving.local_addr(), TENANT).await;
+    tenant.simple_query("BEGIN").await.unwrap();
     tenant.simple_query("SELECT 1").await.unwrap();
     assert_eq!(proxy_connections(&admin).await, "1");
-    drop(tenant);
+    let leaving = tokio::spawn(async move {
+        tokio::time::sleep(GRACE / 3).await;
+        tenant.simple_query("COMMIT").await.unwrap();
+        drop(tenant);
+    });
 
     let stopped = serving.shutdown().await;
 
+    leaving.await.unwrap();
     assert_eq!(stopped.closed, 1);
     assert_eq!(stopped.held, 0);
     assert_eq!(
@@ -187,7 +193,12 @@ async fn a_node_that_stopped_takes_no_new_client() {
 
     serving.shutdown().await;
 
-    let refused = tokio_postgres::connect(&connection_string(proxy, TENANT), NoTls).await;
+    let refused = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio_postgres::connect(&connection_string(proxy, TENANT), NoTls),
+    )
+    .await
+    .expect("a client that arrives after the stop is turned away at once");
     assert!(
         refused.is_err(),
         "a client that arrives after the stop is not taken"
