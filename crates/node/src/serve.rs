@@ -46,6 +46,7 @@ pub struct ServeOptions {
     pub observe_interval: Duration,
     pub wait_timeout: Duration,
     pub shutdown_grace: Duration,
+    pub release_delay: Duration,
 }
 
 impl Default for ServeOptions {
@@ -56,6 +57,7 @@ impl Default for ServeOptions {
             observe_interval: Duration::from_secs(1),
             wait_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(15),
+            release_delay: Duration::from_secs(60),
         }
     }
 }
@@ -218,10 +220,10 @@ pub async fn serve<R: Runtime>(
     let server_tls = Arc::new(node.server_tls()?);
     let policies = cluster.policies();
     let proxy = ProxyId::new(node.node.listen.to_string());
-    let coordinator = Arc::new(InProcessCoordinator::new(
-        proxy.clone(),
-        WeightedMaxMinFair::default(),
-    ));
+    let coordinator = Arc::new(
+        InProcessCoordinator::new(proxy.clone(), WeightedMaxMinFair::default())
+            .with_release_delay(options.release_delay),
+    );
     coordinator.set_policies(policies.clone());
 
     let mut tasks = Vec::new();

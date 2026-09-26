@@ -16,6 +16,7 @@ fn claim(key: u32, min: u32, max: u32, weight: u32, demand: u32) -> Claim<u32> {
         weight: NonZeroU32::new(weight).unwrap(),
         demand,
         current: 0,
+        may_release: true,
     }
 }
 
@@ -25,6 +26,13 @@ fn open(key: u32, min: u32, weight: u32, demand: u32) -> Claim<u32> {
 
 fn holding(entry: Claim<u32>, current: u32) -> Claim<u32> {
     Claim { current, ..entry }
+}
+
+fn not_yet_releasing(entry: Claim<u32>) -> Claim<u32> {
+    Claim {
+        may_release: false,
+        ..entry
+    }
 }
 
 fn carry(claims: &[Claim<u32>], grants: &Grants<u32>) -> Vec<Claim<u32>> {
@@ -207,21 +215,62 @@ fn an_allocator_that_releases_everything_keeps_no_idle_slot() {
     assert_eq!(grants.get(&1), 0);
 }
 
+#[test]
+fn a_holder_that_may_not_release_yet_keeps_every_idle_slot() {
+    let grants = fair().allocate(10, &[not_yet_releasing(holding(open(1, 0, 1, 0), 5))]);
+
+    assert_eq!(grants.get(&1), 5);
+}
+
+#[test]
+fn demand_outranks_a_holder_that_may_not_release_yet() {
+    let claims = [
+        not_yet_releasing(holding(open(1, 0, 1, 0), 5)),
+        open(2, 0, 1, 5),
+    ];
+
+    let grants = fair().allocate(5, &claims);
+
+    assert_eq!(grants.get(&1), 0);
+    assert_eq!(grants.get(&2), 5);
+}
+
+#[test]
+fn a_holder_that_may_not_release_yet_keeps_only_what_the_others_leave() {
+    let claims = [
+        not_yet_releasing(holding(open(1, 0, 1, 0), 5)),
+        open(2, 0, 1, 3),
+    ];
+
+    let grants = fair().allocate(5, &claims);
+
+    assert_eq!(grants.get(&1), 2);
+    assert_eq!(grants.get(&2), 3);
+}
+
 fn arb_sized_claims(count: std::ops::Range<usize>) -> impl Strategy<Value = Vec<Claim<u32>>> {
     prop::collection::vec(
-        (0u32..=20, 0u32..=30, 1u32..=4, 0u32..=50, 0u32..=20),
+        (
+            (0u32..=20, 0u32..=30, 1u32..=4, 0u32..=50, 0u32..=20),
+            any::<bool>(),
+        ),
         count,
     )
     .prop_map(|rows| {
         rows.into_iter()
             .enumerate()
-            .map(|(index, (min, span, weight, demand, current))| {
-                let key = u32::try_from(index).unwrap();
-                holding(
-                    claim(key, min, min.saturating_add(span), weight, demand),
-                    current,
-                )
-            })
+            .map(
+                |(index, ((min, span, weight, demand, current), may_release))| {
+                    let key = u32::try_from(index).unwrap();
+                    Claim {
+                        may_release,
+                        ..holding(
+                            claim(key, min, min.saturating_add(span), weight, demand),
+                            current,
+                        )
+                    }
+                },
+            )
             .collect()
     })
 }
@@ -266,7 +315,11 @@ proptest! {
     ) {
         let grants = WeightedMaxMinFair::new(release).allocate(budget, &claims);
         for entry in &claims {
-            let kept = entry.current.saturating_sub(release);
+            let kept = if entry.may_release {
+                entry.current.saturating_sub(release)
+            } else {
+                entry.current
+            };
             prop_assert!(grants.get(&entry.key) <= entry.demand.max(kept).min(entry.max));
         }
     }

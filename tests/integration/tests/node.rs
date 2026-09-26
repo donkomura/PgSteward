@@ -127,6 +127,7 @@ async fn the_node_serves_its_tenants_within_the_budget_it_derives() {
         cluster_config(&instance),
         ServeOptions {
             margin: 0,
+            release_delay: Duration::from_millis(100),
             ..ServeOptions::default()
         },
     )
@@ -176,7 +177,7 @@ async fn the_node_serves_its_tenants_within_the_budget_it_derives() {
     assert_eq!(
         serving.pool_count(),
         0,
-        "tenants whose clients have gone keep no pool"
+        "tenants whose clients have gone keep no pool once the release delay has passed"
     );
 }
 

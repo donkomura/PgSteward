@@ -113,6 +113,7 @@ pub trait GrantChannel: Send + Sync {
 pub struct InProcessCoordinator<A> {
     proxy: ProxyId,
     allocator: A,
+    release_delay: Duration,
     state: Mutex<State>,
     grants: watch::Sender<GrantSet>,
     /// Ticks once per report. A setting that waits for the proxies to
@@ -130,6 +131,8 @@ struct State {
     held: BTreeMap<Slot, Held>,
     generation: u64,
     departed: bool,
+    now: Option<Instant>,
+    idle_since: BTreeMap<Slot, Instant>,
 }
 
 /// How many connections a holder may still have on the instance.
@@ -151,10 +154,17 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         Self {
             proxy,
             allocator,
+            release_delay: Duration::ZERO,
             state: Mutex::new(State::default()),
             grants,
             reports,
         }
+    }
+
+    #[must_use]
+    pub fn with_release_delay(mut self, delay: Duration) -> Self {
+        self.release_delay = delay;
+        self
     }
 
     /// Takes `instance` under the coordinator with the total budget derived
@@ -306,8 +316,14 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         self.lock().table.clone()
     }
 
+    pub fn reconcile_at(&self, now: Instant) -> Result<(), PreconditionError> {
+        self.lock().now = Some(now);
+        self.reconcile()
+    }
+
     pub fn reconcile(&self) -> Result<(), PreconditionError> {
         let mut state = self.lock();
+        self.track_idle(&mut state);
         let entry = self.desired_state(&state);
         let previous = self.published(&state.table);
         state.table.apply(&entry)?;
@@ -338,7 +354,7 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
 
     pub async fn run<K: Clock>(&self, clock: &K, interval: Duration) {
         loop {
-            if let Err(error) = self.reconcile() {
+            if let Err(error) = self.reconcile_at(clock.now()) {
                 tracing::error!(%error, "the desired state was rejected by the allocation table");
             }
             clock.sleep(interval).await;
@@ -408,10 +424,35 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
                         .copied()
                         .unwrap_or(0),
                     current: state.table.granted(instance, &holder),
+                    may_release: self.may_release(state, instance, tenant),
                     key: holder,
                 })
             })
             .collect()
+    }
+
+    fn track_idle(&self, state: &mut State) {
+        let Some(now) = state.now else {
+            return;
+        };
+        let idle: BTreeSet<Slot> = self
+            .published(&state.table)
+            .into_iter()
+            .filter(|(slot, granted)| state.demand.get(slot).copied().unwrap_or(0) < *granted)
+            .map(|(slot, _)| slot)
+            .collect();
+        state.idle_since.retain(|slot, _| idle.contains(slot));
+        for slot in idle {
+            state.idle_since.entry(slot).or_insert(now);
+        }
+    }
+
+    fn may_release(&self, state: &State, instance: &InstanceId, tenant: &TenantId) -> bool {
+        let slot = (instance.clone(), tenant.clone());
+        match (state.now, state.idle_since.get(&slot)) {
+            (Some(now), Some(since)) => now.duration_since(*since) >= self.release_delay,
+            _ => true,
+        }
     }
 
     fn published(&self, table: &AllocationTable) -> BTreeMap<Slot, u32> {

@@ -20,6 +20,7 @@ type Key = (InstanceId, TenantId);
 /// without a grant, without a connection and without anyone holding it.
 pub struct ProxyPools<O: OpenServer, K: Clock> {
     pools: Mutex<BTreeMap<Key, Entry<O, K>>>,
+    opened_by_dropped: Mutex<BTreeMap<Key, u64>>,
 }
 
 struct Entry<O: OpenServer, K: Clock> {
@@ -32,6 +33,7 @@ impl<O: OpenServer, K: Clock> ProxyPools<O, K> {
     pub fn new() -> Self {
         Self {
             pools: Mutex::new(BTreeMap::new()),
+            opened_by_dropped: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -114,10 +116,14 @@ impl<O: OpenServer, K: Clock> ProxyPools<O, K> {
     /// What every pool holds right now, for the admin console to read.
     #[must_use]
     pub fn stats(&self) -> Vec<(InstanceId, TenantId, PoolStats)> {
-        self.lock()
+        let pools = self.lock();
+        let opened_by_dropped = self.opened_by_dropped();
+        pools
             .iter()
-            .map(|((instance, tenant), entry)| {
-                (instance.clone(), tenant.clone(), entry.pool.stats())
+            .map(|(key, entry)| {
+                let mut stats = entry.pool.stats();
+                stats.opened += opened_by_dropped.get(key).copied().unwrap_or(0);
+                (key.0.clone(), key.1.clone(), stats)
             })
             .collect()
     }
@@ -132,6 +138,12 @@ impl<O: OpenServer, K: Clock> ProxyPools<O, K> {
     fn lock(&self) -> MutexGuard<'_, BTreeMap<Key, Entry<O, K>>> {
         self.pools.lock().expect("proxy pools lock poisoned")
     }
+
+    fn opened_by_dropped(&self) -> MutexGuard<'_, BTreeMap<Key, u64>> {
+        self.opened_by_dropped
+            .lock()
+            .expect("opened connection count lock poisoned")
+    }
 }
 
 impl<O: OpenServer, K: Clock> ProxyPools<O, K>
@@ -144,8 +156,14 @@ where
             let grant = grants.get(&instance, &tenant) as usize;
             closed += pool.converge(grant).await;
         }
-        self.lock().retain(|(instance, tenant), entry| {
-            grants.get(instance, tenant) > 0 || !entry.pool.is_unused()
+        let mut pools = self.lock();
+        let mut opened_by_dropped = self.opened_by_dropped();
+        pools.retain(|key, entry| {
+            let kept = grants.get(&key.0, &key.1) > 0 || !entry.pool.is_unused();
+            if !kept {
+                *opened_by_dropped.entry(key.clone()).or_default() += entry.pool.stats().opened;
+            }
+            kept
         });
         closed
     }
