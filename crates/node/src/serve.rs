@@ -593,13 +593,14 @@ impl<R: Runtime> ConsoleNode for Front<R> {
     fn view(&self) -> ConsoleView {
         let policies = self.coordinator.policies();
         ConsoleView {
-            proxy: self.proxy.clone(),
+            proxies: vec![self.proxy.clone()],
             pool_mode: self.pool_mode.to_owned(),
             pools: self
                 .pools
                 .stats()
                 .into_iter()
                 .map(|(instance, tenant, stats)| PoolSnapshot {
+                    proxy: self.proxy.clone(),
                     policy: policies.policy(&instance, &tenant),
                     instance,
                     tenant,

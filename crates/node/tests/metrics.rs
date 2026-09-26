@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const PROXY: &str = "10.0.0.1:6432";
+const SECOND_PROXY: &str = "10.0.0.1:6432/1";
 const OTHER_PROXY: &str = "10.0.0.2:6432";
 const INSTANCE: &str = "db-a";
 
@@ -74,7 +75,7 @@ fn view(
     instances: Vec<InstanceSnapshot>,
 ) -> ConsoleView {
     ConsoleView {
-        proxy: ProxyId::new(PROXY),
+        proxies: vec![ProxyId::new(PROXY)],
         pool_mode: "transaction".to_owned(),
         pools,
         instances,
@@ -96,6 +97,7 @@ fn one_pool() -> ConsoleView {
     view(
         table,
         vec![PoolSnapshot {
+            proxy: ProxyId::new(PROXY),
             instance: instance(),
             tenant: tenant("app_web"),
             policy: Some(policy(2, 8)),
@@ -239,6 +241,67 @@ fn a_grant_held_by_another_proxy_reports_no_connections() {
 }
 
 #[test]
+fn a_tenant_several_proxies_of_this_node_serve_is_reported_once() {
+    let text = exposition(&ConsoleView {
+        proxies: vec![ProxyId::new(PROXY), ProxyId::new(SECOND_PROXY)],
+        pool_mode: "transaction".to_owned(),
+        pools: vec![
+            PoolSnapshot {
+                proxy: ProxyId::new(PROXY),
+                instance: instance(),
+                tenant: tenant("app_web"),
+                policy: Some(policy(2, 8)),
+                stats: PoolStats {
+                    opened: 5,
+                    ..stats(1, 2, 0, 0, 1)
+                },
+            },
+            PoolSnapshot {
+                proxy: ProxyId::new(SECOND_PROXY),
+                instance: instance(),
+                tenant: tenant("app_web"),
+                policy: Some(policy(2, 8)),
+                stats: PoolStats {
+                    opened: 7,
+                    ..stats(2, 1, 0, 1, 0)
+                },
+            },
+        ],
+        instances: Vec::new(),
+        table: table(&Entry::new().instance(instance(), Desired::new(70))),
+    });
+
+    assert_eq!(
+        value(
+            &text,
+            r#"pgsteward_server_connections{instance="db-a",database="app",user="app_web",state="idle"}"#
+        ),
+        3
+    );
+    assert_eq!(
+        value(
+            &text,
+            r#"pgsteward_server_connections_opened_total{instance="db-a",database="app",user="app_web"}"#
+        ),
+        12
+    );
+    assert_eq!(
+        value(
+            &text,
+            r#"pgsteward_demand_slots{instance="db-a",database="app",user="app_web"}"#
+        ),
+        5
+    );
+    assert_eq!(
+        value(
+            &text,
+            r#"pgsteward_tenant_max_slots{instance="db-a",database="app",user="app_web"}"#
+        ),
+        8
+    );
+}
+
+#[test]
 fn the_waiting_clients_and_the_demand_they_make_are_reported() {
     let text = exposition(&one_pool());
 
@@ -263,6 +326,7 @@ fn a_tenant_no_rule_covers_reports_no_share() {
     let text = exposition(&view(
         table(&Entry::new().instance(instance(), Desired::new(70))),
         vec![PoolSnapshot {
+            proxy: ProxyId::new(PROXY),
             instance: instance(),
             tenant: tenant("app_web"),
             policy: None,

@@ -312,6 +312,7 @@ const INSTANCE_COLUMNS: [Column<'static>; 10] = [
 /// One pool of this node, as it stood when the view was taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSnapshot {
+    pub proxy: ProxyId,
     pub instance: InstanceId,
     pub tenant: TenantId,
     /// The share the cluster configuration gives this tenant, or `None` when
@@ -334,7 +335,7 @@ pub struct InstanceSnapshot {
 /// are written, so a table never mixes two states of the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleView {
-    pub proxy: ProxyId,
+    pub proxies: Vec<ProxyId>,
     pub pool_mode: String,
     pub pools: Vec<PoolSnapshot>,
     pub instances: Vec<InstanceSnapshot>,
@@ -399,7 +400,7 @@ pub fn show_pools(view: &ConsoleView) -> ResultSet {
     let rows = pools
         .into_iter()
         .map(|pool| {
-            let holder = Holder::new(pool.tenant.clone(), view.proxy.clone());
+            let holder = Holder::new(pool.tenant.clone(), pool.proxy.clone());
             Row::new()
                 .value(pool.tenant.database())
                 .value(pool.tenant.user())
@@ -433,8 +434,8 @@ pub fn show_budget(view: &ConsoleView) -> ResultSet {
     let mut rows = Vec::new();
     for instance in view.table.instances() {
         for (holder, slots) in view.table.holders(instance) {
-            let actual =
-                (holder.proxy() == &view.proxy).then(|| view.actual_of(instance, holder.tenant()));
+            let actual = (Some(holder.proxy()) == view.proxies.first())
+                .then(|| view.actual_of(instance, holder.tenant()));
             rows.push(
                 Row::new()
                     .value(instance)
