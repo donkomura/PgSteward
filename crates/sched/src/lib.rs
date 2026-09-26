@@ -11,6 +11,7 @@ pub struct Claim<K> {
     pub weight: NonZeroU32,
     pub demand: u32,
     pub current: u32,
+    pub may_release: bool,
 }
 
 impl<K> Claim<K> {
@@ -26,6 +27,7 @@ impl<K> Claim<K> {
 
     #[must_use]
     pub fn kept(&self, release: u32) -> u32 {
+        let release = if self.may_release { release } else { 0 };
         self.current.saturating_sub(release).min(self.max)
     }
 }
