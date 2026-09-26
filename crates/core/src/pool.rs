@@ -90,6 +90,7 @@ pub struct PoolStats {
     pub opening: usize,
     pub closing: usize,
     pub waiting: usize,
+    pub opened: u64,
 }
 
 impl PoolStats {
@@ -143,6 +144,7 @@ impl<O: OpenServer, K: Clock> Pool<O, K> {
                     retiring: Vec::new(),
                     waiters: VecDeque::new(),
                     next_ticket: 0,
+                    opened: 0,
                 }),
             }),
         }
@@ -329,6 +331,7 @@ struct State<C> {
     retiring: Vec<C>,
     waiters: VecDeque<Waiter<C>>,
     next_ticket: u64,
+    opened: u64,
 }
 
 impl<C> State<C> {
@@ -408,6 +411,7 @@ impl<C> Inner<C> {
             opening: state.opening,
             closing: state.closing,
             waiting: state.waiters.len(),
+            opened: state.opened,
         }
     }
 
@@ -500,6 +504,7 @@ impl<C> Reservation<C> {
         let mut state = self.pool.lock();
         state.opening -= 1;
         state.in_use += 1;
+        state.opened += 1;
         drop(state);
         self.held = false;
         Assigned::new(connection, &self.pool)

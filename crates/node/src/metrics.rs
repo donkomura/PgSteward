@@ -6,7 +6,7 @@ use pgsteward_core::console::{ConsoleNode, ConsoleView, PoolSnapshot};
 use pgsteward_core::rt::{Listener, Runtime};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet};
+use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, NoLabelSet};
 use prometheus_client::metrics::MetricType;
 use prometheus_client::registry::Registry;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -162,6 +162,14 @@ fn encode_pools(encoder: &mut DescriptorEncoder, view: &ConsoleView) -> Result<(
             .iter()
             .map(|pool| (labels_of(pool), counted(pool.stats.opening))),
     )?;
+    counters(
+        encoder,
+        "server_connections_opened",
+        "Server connections this node has opened for a tenant since it started",
+        pools
+            .iter()
+            .map(|pool| (labels_of(pool), pool.stats.opened)),
+    )?;
     gauges(
         encoder,
         "clients_waiting",
@@ -275,6 +283,21 @@ fn gauges<S: EncodeLabelSet>(
     let mut metric = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
     for (labels, value) in series {
         metric.encode_family(&labels)?.encode_gauge(&value)?;
+    }
+    Ok(())
+}
+
+fn counters<S: EncodeLabelSet>(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    series: impl IntoIterator<Item = (S, u64)>,
+) -> Result<(), fmt::Error> {
+    let mut metric = encoder.encode_descriptor(name, help, None, MetricType::Counter)?;
+    for (labels, value) in series {
+        metric
+            .encode_family(&labels)?
+            .encode_counter::<NoLabelSet, _, u64>(&value, None)?;
     }
     Ok(())
 }
