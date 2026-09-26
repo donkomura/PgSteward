@@ -63,6 +63,22 @@ fn a_shrinking_grant_is_taken_first_from_the_proxy_holding_the_most() {
 }
 
 #[test]
+fn a_shrinking_grant_is_taken_first_from_what_is_held_beyond_demand() {
+    let granted = split(5, &[share(1, 5, 5), retained(share(2, 0, 3))]);
+
+    assert_eq!(of(&granted, 1), 5);
+    assert_eq!(of(&granted, 2), 0);
+}
+
+#[test]
+fn a_grant_shrinking_by_one_releases_an_idle_slot_rather_than_a_busy_one() {
+    let granted = split(7, &[share(1, 5, 5), retained(share(2, 0, 3))]);
+
+    assert_eq!(of(&granted, 1), 5);
+    assert_eq!(of(&granted, 2), 2);
+}
+
+#[test]
 fn a_proxy_within_its_release_delay_keeps_a_grant_above_its_demand() {
     let granted = split(5, &[retained(share(1, 0, 2)), share(2, 3, 0)]);
 

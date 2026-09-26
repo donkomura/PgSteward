@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use pgsteward_sched::{Allocator, Claim};
@@ -514,4 +514,37 @@ impl<A: Allocator<Holder> + Send + Sync> GrantChannel for InProcessCoordinator<A
         self.reports
             .send_modify(|count| *count = count.wrapping_add(1));
     }
+}
+
+#[derive(Debug)]
+pub struct ProxyChannel<A> {
+    coordinator: Arc<InProcessCoordinator<A>>,
+    proxy: ProxyId,
+}
+
+impl<A: Allocator<Holder>> InProcessCoordinator<A> {
+    #[must_use]
+    pub fn channel(self: &Arc<Self>, proxy: ProxyId) -> ProxyChannel<A> {
+        ProxyChannel {
+            coordinator: Arc::clone(self),
+            proxy,
+        }
+    }
+}
+
+impl<A: Allocator<Holder>> ProxyChannel<A> {
+    #[must_use]
+    pub fn proxy(&self) -> &ProxyId {
+        &self.proxy
+    }
+
+    pub fn withdraw(&self) {}
+}
+
+impl<A: Allocator<Holder> + Send + Sync> GrantChannel for ProxyChannel<A> {
+    fn grants(&self) -> watch::Receiver<GrantSet> {
+        watch::channel(GrantSet::default()).1
+    }
+
+    fn report(&self, _report: Report) {}
 }
