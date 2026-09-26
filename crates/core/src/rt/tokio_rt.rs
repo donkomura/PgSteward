@@ -40,8 +40,10 @@ impl Spawner for TokioRuntime {
 impl Listener for TcpListener {
     type Stream = TcpStream;
 
-    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
-        TcpListener::accept(self)
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let (stream, addr) = TcpListener::accept(self).await?;
+        stream.set_nodelay(true)?;
+        Ok((stream, addr))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -58,6 +60,11 @@ impl Net for TokioRuntime {
     }
 
     fn connect(&self, addr: &str) -> impl Future<Output = io::Result<TcpStream>> + Send {
-        TcpStream::connect(addr.to_owned())
+        let addr = addr.to_owned();
+        async move {
+            let stream = TcpStream::connect(addr).await?;
+            stream.set_nodelay(true)?;
+            Ok(stream)
+        }
     }
 }
