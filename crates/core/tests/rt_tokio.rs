@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use pgsteward_core::rt::{Clock, Net, Spawner, tokio_rt::TokioRuntime};
+use pgsteward_core::rt::{Clock, Listener, Net, Spawner, tokio_rt::TokioRuntime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
@@ -37,4 +37,23 @@ async fn net_bind_connect_roundtrip() {
     client.read_exact(&mut echoed).await.unwrap();
     assert_eq!(&echoed, b"ping");
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn net_streams_send_small_messages_without_waiting_to_coalesce() {
+    let rt = TokioRuntime::new();
+    let listener = rt.bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let client = rt.connect(&addr.to_string()).await.unwrap();
+    let (server, _) = Listener::accept(&listener).await.unwrap();
+
+    assert!(
+        client.nodelay().unwrap(),
+        "a connected stream disables Nagle"
+    );
+    assert!(
+        server.nodelay().unwrap(),
+        "an accepted stream disables Nagle"
+    );
 }
