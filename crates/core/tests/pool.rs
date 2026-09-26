@@ -657,3 +657,36 @@ async fn the_slot_of_a_connection_whose_reset_fails_goes_to_the_waiting_client()
     );
     assert_eq!(opener.peak(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_pool_counts_every_connection_it_opens() {
+    let opener = Opener::default();
+    let pool = pool(opener.clone(), 1);
+    assert_eq!(pool.stats().opened, 0);
+
+    drop(pool.acquire().await.unwrap());
+    drop(pool.acquire().await.unwrap());
+    assert_eq!(
+        pool.stats().opened,
+        1,
+        "a reused connection is not a new one"
+    );
+
+    pool.acquire().await.unwrap().discard().await;
+    let replacement = pool.acquire().await.unwrap();
+
+    assert_eq!(pool.stats().opened, 2);
+    assert_eq!(pool.stats().opened, opener.opened() as u64);
+    drop(replacement);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_open_the_instance_refused_is_not_counted() {
+    let opener = Opener::refusing(1);
+    let pool = pool(opener.clone(), 1);
+
+    assert!(pool.acquire().await.is_err());
+
+    assert_eq!(opener.attempts(), 1);
+    assert_eq!(pool.stats().opened, 0);
+}

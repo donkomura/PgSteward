@@ -52,6 +52,7 @@ fn stats(idle: usize, in_use: usize, opening: usize, waiting: usize) -> PoolStat
         opening,
         closing: 0,
         waiting,
+        opened: 0,
     }
 }
 

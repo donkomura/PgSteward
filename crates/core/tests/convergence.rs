@@ -138,6 +138,7 @@ fn demand_is_the_waiting_clients_and_the_connections_in_use() {
         opening: 1,
         closing: 1,
         waiting: 3,
+        opened: 0,
     };
 
     assert_eq!(stats.demand(), 6);
@@ -152,6 +153,7 @@ fn occupied_counts_every_connection_the_instance_may_hold() {
         opening: 1,
         closing: 1,
         waiting: 3,
+        opened: 0,
     };
 
     assert_eq!(stats.occupied(), 5);
@@ -458,4 +460,25 @@ async fn draining_leaves_the_connection_a_client_still_holds() {
     assert_eq!(opener.live(), 1);
     assert_eq!(pools.occupied(), 1);
     drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_connections_a_dropped_pool_opened_stay_counted() {
+    let opener = Opener::default();
+    let pools = ProxyPools::new();
+    let (alice, _) = pools.checkout(&primary(), &tenant("alice"), || pool(opener.clone()));
+    alice.converge(1).await;
+    drop(alice.acquire().await.unwrap());
+    drop(alice);
+    pools.converge(&GrantSet::default()).await;
+    assert!(pools.get(&primary(), &tenant("alice")).is_none());
+
+    let (alice, _) = pools.checkout(&primary(), &tenant("alice"), || pool(opener.clone()));
+    alice.converge(1).await;
+    let served = alice.acquire().await.unwrap();
+
+    let stats = pools.stats();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].2.opened, 2);
+    drop(served);
 }

@@ -46,6 +46,7 @@ fn stats(idle: usize, in_use: usize, closing: usize, opening: usize, waiting: us
         opening,
         closing,
         waiting,
+        opened: 0,
     }
 }
 
@@ -98,7 +99,10 @@ fn one_pool() -> ConsoleView {
             instance: instance(),
             tenant: tenant("app_web"),
             policy: Some(policy(2, 8)),
-            stats: stats(2, 3, 1, 1, 4),
+            stats: PoolStats {
+                opened: 17,
+                ..stats(2, 3, 1, 1, 4)
+            },
         }],
         vec![InstanceSnapshot {
             instance: instance(),
@@ -195,6 +199,23 @@ fn the_connection_states_add_up_to_what_the_budget_counts() {
             r#"pgsteward_server_connections_opening{instance="db-a",database="app",user="app_web"}"#
         ),
         1
+    );
+}
+
+#[test]
+fn every_server_connection_the_node_opened_is_counted() {
+    let text = exposition(&one_pool());
+
+    assert_eq!(
+        value(
+            &text,
+            r#"pgsteward_server_connections_opened_total{instance="db-a",database="app",user="app_web"}"#
+        ),
+        17
+    );
+    assert!(
+        text.contains("# TYPE pgsteward_server_connections_opened counter"),
+        "{text}"
     );
 }
 
