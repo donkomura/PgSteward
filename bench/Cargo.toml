@@ -1,0 +1,25 @@
+[package]
+name = "pgsteward-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+pgsteward-core.workspace = true
+pgsteward-harness = { workspace = true, features = ["postgres"] }
+pgsteward-node.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+
+[lints]
+workspace = true
