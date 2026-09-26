@@ -711,3 +711,83 @@ fn a_proxy_that_gave_its_grants_back_is_granted_nothing_again() {
     assert_eq!(granted(&coordinator, "alice"), 0);
     assert_eq!(coordinator.table().holders(&primary()).count(), 0);
 }
+
+const RELEASE_DELAY: Duration = Duration::from_secs(1);
+
+#[test]
+fn an_idle_grant_is_kept_for_the_release_delay() {
+    let coordinator = coordinator(10, &["alice"]).with_release_delay(RELEASE_DELAY);
+    let start = Instant::now();
+    report(&coordinator, &[("alice", 2, 0)]);
+    coordinator.reconcile_at(start).unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 2);
+
+    report(&coordinator, &[("alice", 0, 2)]);
+    coordinator.reconcile_at(start).unwrap();
+    coordinator
+        .reconcile_at(start + RELEASE_DELAY - Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 2);
+
+    coordinator.reconcile_at(start + RELEASE_DELAY).unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 1);
+    coordinator
+        .reconcile_at(start + RELEASE_DELAY + Duration::from_millis(10))
+        .unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 0);
+}
+
+#[test]
+fn demand_that_returns_within_the_release_delay_starts_it_over() {
+    let coordinator = coordinator(10, &["alice"]).with_release_delay(RELEASE_DELAY);
+    let start = Instant::now();
+    report(&coordinator, &[("alice", 2, 0)]);
+    coordinator.reconcile_at(start).unwrap();
+    report(&coordinator, &[("alice", 0, 2)]);
+    coordinator.reconcile_at(start).unwrap();
+
+    report(&coordinator, &[("alice", 2, 2)]);
+    coordinator
+        .reconcile_at(start + Duration::from_millis(900))
+        .unwrap();
+    report(&coordinator, &[("alice", 0, 2)]);
+    let idle_again = start + RELEASE_DELAY;
+    coordinator.reconcile_at(idle_again).unwrap();
+    coordinator
+        .reconcile_at(idle_again + RELEASE_DELAY - Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 2);
+
+    coordinator
+        .reconcile_at(idle_again + RELEASE_DELAY)
+        .unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 1);
+}
+
+#[test]
+fn a_grant_kept_for_the_release_delay_gives_way_to_demand() {
+    let coordinator = coordinator(2, &["alice", "bob"]).with_release_delay(RELEASE_DELAY);
+    let start = Instant::now();
+    report(&coordinator, &[("alice", 2, 0)]);
+    coordinator.reconcile_at(start).unwrap();
+    assert_eq!(granted(&coordinator, "alice"), 2);
+
+    report(&coordinator, &[("alice", 0, 2), ("bob", 2, 0)]);
+    coordinator
+        .reconcile_at(start + Duration::from_millis(10))
+        .unwrap();
+
+    assert_eq!(granted(&coordinator, "alice"), 0);
+}
+
+#[test]
+fn a_coordinator_that_was_never_told_the_time_releases_as_before() {
+    let coordinator = coordinator(10, &["alice"]).with_release_delay(RELEASE_DELAY);
+    report(&coordinator, &[("alice", 2, 0)]);
+    coordinator.reconcile().unwrap();
+    report(&coordinator, &[("alice", 0, 2)]);
+
+    coordinator.reconcile().unwrap();
+
+    assert_eq!(granted(&coordinator, "alice"), 1);
+}
