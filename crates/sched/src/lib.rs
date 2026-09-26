@@ -1,4 +1,5 @@
 pub mod fair;
+pub mod split;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
