@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -309,13 +309,29 @@ const INSTANCE_COLUMNS: [Column<'static>; 10] = [
     Column::count("tenants"),
 ];
 
-/// One pool of this node, as it stood when the view was taken.
+/// One pool of one proxy of this node, as it stood when the view was taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSnapshot {
+    pub proxy: ProxyId,
     pub instance: InstanceId,
     pub tenant: TenantId,
     /// The share the cluster configuration gives this tenant, or `None` when
     /// no rule covers it.
+    pub policy: Option<TenantPolicy>,
+    pub stats: PoolStats,
+}
+
+/// One tenant's pools on one instance, taken together over every proxy of
+/// this node.
+///
+/// How many proxies a node runs is how it spreads its work over its cores, so
+/// what a tenant is served on a node is read as one pool whatever that number.
+/// The proxies stay apart where the connection cap is kept: each holds its own
+/// grant, and `SHOW BUDGET` puts each beside its own connections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePool {
+    pub instance: InstanceId,
+    pub tenant: TenantId,
     pub policy: Option<TenantPolicy>,
     pub stats: PoolStats,
 }
@@ -334,7 +350,8 @@ pub struct InstanceSnapshot {
 /// are written, so a table never mixes two states of the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleView {
-    pub proxy: ProxyId,
+    /// Every proxy this node runs.
+    pub proxies: Vec<ProxyId>,
     pub pool_mode: String,
     pub pools: Vec<PoolSnapshot>,
     pub instances: Vec<InstanceSnapshot>,
@@ -342,9 +359,47 @@ pub struct ConsoleView {
 }
 
 impl ConsoleView {
-    /// The connections this node holds on `instance` for `tenant`.
-    fn actual_of(&self, instance: &InstanceId, tenant: &TenantId) -> usize {
-        self.sum(|pool| &pool.instance == instance && &pool.tenant == tenant)
+    /// Every tenant's pools on every instance, in the order of the instance and
+    /// then the tenant.
+    #[must_use]
+    pub fn node_pools(&self) -> Vec<NodePool> {
+        let mut pools: BTreeMap<(&InstanceId, &TenantId), NodePool> = BTreeMap::new();
+        for pool in &self.pools {
+            pools
+                .entry((&pool.instance, &pool.tenant))
+                .and_modify(|merged| merged.stats += pool.stats)
+                .or_insert_with(|| NodePool {
+                    instance: pool.instance.clone(),
+                    tenant: pool.tenant.clone(),
+                    policy: pool.policy,
+                    stats: pool.stats,
+                });
+        }
+        pools.into_values().collect()
+    }
+
+    /// The slots this node is granted on `instance` for `tenant`, over every
+    /// proxy it runs.
+    fn granted_to(&self, instance: &InstanceId, tenant: &TenantId) -> u32 {
+        self.proxies
+            .iter()
+            .map(|proxy| {
+                self.table
+                    .granted(instance, &Holder::new(tenant.clone(), proxy.clone()))
+            })
+            .sum()
+    }
+
+    /// The connections `holder` holds on `instance`, if it is a proxy of this
+    /// node.
+    fn actual_of(&self, instance: &InstanceId, holder: &Holder) -> Option<usize> {
+        self.proxies.contains(holder.proxy()).then(|| {
+            self.sum(|pool| {
+                &pool.instance == instance
+                    && &pool.tenant == holder.tenant()
+                    && &pool.proxy == holder.proxy()
+            })
+        })
     }
 
     /// The connections this node holds on `instance`, over every tenant.
@@ -392,14 +447,10 @@ impl ResultSet {
 /// connections it actually has, and the demand that asked for them.
 #[must_use]
 pub fn show_pools(view: &ConsoleView) -> ResultSet {
-    let mut pools: Vec<&PoolSnapshot> = view.pools.iter().collect();
-    pools.sort_by(|left, right| {
-        (&left.instance, &left.tenant).cmp(&(&right.instance, &right.tenant))
-    });
-    let rows = pools
+    let rows = view
+        .node_pools()
         .into_iter()
         .map(|pool| {
-            let holder = Holder::new(pool.tenant.clone(), view.proxy.clone());
             Row::new()
                 .value(pool.tenant.database())
                 .value(pool.tenant.user())
@@ -409,7 +460,7 @@ pub fn show_pools(view: &ConsoleView) -> ResultSet {
                 .value(pool.stats.idle)
                 .value(pool.stats.opening)
                 .value(&view.pool_mode)
-                .value(view.table.granted(&pool.instance, &holder))
+                .value(view.granted_to(&pool.instance, &pool.tenant))
                 .value(pool.stats.actual())
                 .maybe(pool.policy.map(|policy| policy.min))
                 .maybe(pool.policy.map(|policy| policy.max))
@@ -427,14 +478,13 @@ pub fn show_pools(view: &ConsoleView) -> ResultSet {
 /// granted, and the slots that are granted to no one.
 ///
 /// The actual connections are known for this node alone, so a grant held by
-/// another proxy leaves that column null rather than claiming a zero.
+/// a proxy of another node leaves that column null rather than claiming a zero.
 #[must_use]
 pub fn show_budget(view: &ConsoleView) -> ResultSet {
     let mut rows = Vec::new();
     for instance in view.table.instances() {
         for (holder, slots) in view.table.holders(instance) {
-            let actual =
-                (holder.proxy() == &view.proxy).then(|| view.actual_of(instance, holder.tenant()));
+            let actual = view.actual_of(instance, holder);
             rows.push(
                 Row::new()
                     .value(instance)

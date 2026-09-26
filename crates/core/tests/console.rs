@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 use tokio::task::JoinHandle;
 
 const PROXY: &str = "10.0.0.1:6432";
+const SECOND_PROXY: &str = "10.0.0.1:6432/1";
 const OTHER_PROXY: &str = "10.0.0.2:6432";
 
 fn instance(name: &str) -> InstanceId {
@@ -74,7 +75,7 @@ fn view(
     instances: Vec<InstanceSnapshot>,
 ) -> ConsoleView {
     ConsoleView {
-        proxy: ProxyId::new(PROXY),
+        proxies: vec![ProxyId::new(PROXY)],
         pool_mode: "transaction".to_owned(),
         pools,
         instances,
@@ -101,6 +102,7 @@ fn a_pool_puts_the_desired_state_next_to_what_the_instance_holds() {
     let view = view(
         table,
         vec![PoolSnapshot {
+            proxy: ProxyId::new(PROXY),
             instance: instance("primary"),
             tenant: tenant("alice"),
             policy: Some(policy(2, 20)),
@@ -154,6 +156,7 @@ fn a_pool_no_tenant_rule_covers_leaves_its_share_null() {
     let view = view(
         AllocationTable::new(),
         vec![PoolSnapshot {
+            proxy: ProxyId::new(PROXY),
             instance: instance("primary"),
             tenant: tenant("alice"),
             policy: None,
@@ -174,18 +177,21 @@ fn pools_come_out_in_one_order_whatever_order_they_were_given_in() {
         AllocationTable::new(),
         vec![
             PoolSnapshot {
+                proxy: ProxyId::new(PROXY),
                 instance: instance("replica"),
                 tenant: tenant("alice"),
                 policy: None,
                 stats: PoolStats::default(),
             },
             PoolSnapshot {
+                proxy: ProxyId::new(PROXY),
                 instance: instance("primary"),
                 tenant: tenant("bob"),
                 policy: None,
                 stats: PoolStats::default(),
             },
             PoolSnapshot {
+                proxy: ProxyId::new(PROXY),
                 instance: instance("primary"),
                 tenant: tenant("alice"),
                 policy: None,
@@ -230,6 +236,7 @@ fn the_budget_names_every_holder_of_every_instance() {
     let view = view(
         table,
         vec![PoolSnapshot {
+            proxy: ProxyId::new(PROXY),
             instance: instance("primary"),
             tenant: tenant("alice"),
             policy: Some(policy(2, 20)),
@@ -320,6 +327,105 @@ fn the_budget_leaves_the_connections_of_another_proxy_unclaimed() {
     );
 }
 
+fn two_proxies_of_this_node() -> ConsoleView {
+    let table = table(
+        &Entry::new().instance(
+            instance("primary"),
+            Desired::new(50)
+                .grant(Holder::new(tenant("alice"), ProxyId::new(PROXY)), 3)
+                .grant(Holder::new(tenant("alice"), ProxyId::new(SECOND_PROXY)), 4),
+        ),
+    );
+    ConsoleView {
+        proxies: vec![ProxyId::new(PROXY), ProxyId::new(SECOND_PROXY)],
+        pool_mode: "transaction".to_owned(),
+        pools: vec![
+            PoolSnapshot {
+                proxy: ProxyId::new(PROXY),
+                instance: instance("primary"),
+                tenant: tenant("alice"),
+                policy: Some(policy(2, 20)),
+                stats: stats(1, 1, 0, 2),
+            },
+            PoolSnapshot {
+                proxy: ProxyId::new(SECOND_PROXY),
+                instance: instance("primary"),
+                tenant: tenant("alice"),
+                policy: Some(policy(2, 20)),
+                stats: stats(1, 3, 0, 0),
+            },
+        ],
+        instances: Vec::new(),
+        table,
+    }
+}
+
+#[test]
+fn a_tenant_several_proxies_of_this_node_serve_is_one_pool() {
+    let set = show_pools(&two_proxies_of_this_node());
+
+    assert_eq!(set.rows.len(), 1);
+    assert_eq!(
+        row(&set, 0),
+        vec![
+            Some("app"),
+            Some("alice"),
+            Some("primary"),
+            Some("2"),
+            Some("4"),
+            Some("2"),
+            Some("0"),
+            Some("transaction"),
+            Some("7"),
+            Some("6"),
+            Some("2"),
+            Some("20"),
+            Some("6"),
+        ]
+    );
+}
+
+#[test]
+fn the_budget_puts_each_proxy_of_this_node_beside_its_own_connections() {
+    let set = show_budget(&two_proxies_of_this_node());
+
+    assert_eq!(
+        row(&set, 0),
+        vec![
+            Some("primary"),
+            Some("alice@app"),
+            Some(PROXY),
+            Some("3"),
+            Some("2"),
+        ]
+    );
+    assert_eq!(
+        row(&set, 1),
+        vec![
+            Some("primary"),
+            Some("alice@app"),
+            Some(SECOND_PROXY),
+            Some("4"),
+            Some("4"),
+        ]
+    );
+}
+
+#[test]
+fn an_instance_counts_the_connections_of_every_proxy_of_this_node() {
+    let view = ConsoleView {
+        instances: vec![InstanceSnapshot {
+            instance: instance("primary"),
+            budget: budget(100, 10, 16),
+        }],
+        ..two_proxies_of_this_node()
+    };
+
+    let set = show_instances(&view);
+
+    assert_eq!(row(&set, 0)[7..10], [Some("7"), Some("6"), Some("1")]);
+}
+
 #[test]
 fn an_instance_explains_its_total_budget_by_the_parts_it_was_derived_from() {
     let table = table(
@@ -333,6 +439,7 @@ fn an_instance_explains_its_total_budget_by_the_parts_it_was_derived_from() {
     let view = view(
         table,
         vec![PoolSnapshot {
+            proxy: ProxyId::new(PROXY),
             instance: instance("primary"),
             tenant: tenant("alice"),
             policy: Some(policy(2, 20)),
@@ -399,6 +506,7 @@ fn a_result_set_is_written_as_its_columns_then_its_rows_then_a_command_tag() {
     let view = view(
         AllocationTable::new(),
         vec![PoolSnapshot {
+            proxy: ProxyId::new(PROXY),
             instance: instance("primary"),
             tenant: tenant("alice"),
             policy: None,
@@ -748,6 +856,7 @@ fn one_pool_view() -> ConsoleView {
     view(
         AllocationTable::new(),
         vec![PoolSnapshot {
+            proxy: ProxyId::new(PROXY),
             instance: instance("primary"),
             tenant: tenant("alice"),
             policy: None,
