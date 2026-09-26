@@ -29,7 +29,11 @@ pub fn split<K: Ord + Clone>(granted: u32, shares: &[Share<K>]) -> BTreeMap<K, u
     let mut total: u64 = given.iter().copied().map(u64::from).sum();
     let granted = u64::from(granted);
     while total > granted {
-        let Some(most) = first_max(given.iter().copied()) else {
+        let excess = order
+            .iter()
+            .zip(&given)
+            .map(|(share, given)| given.saturating_sub(share.demand));
+        let Some(most) = first_max(excess).or_else(|| first_max(given.iter().copied())) else {
             break;
         };
         given[most] -= 1;

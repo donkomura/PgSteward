@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use pgsteward_sched::split::{Share, split};
 use pgsteward_sched::{Allocator, Claim};
 use tokio::sync::watch;
 
@@ -108,14 +109,14 @@ pub trait GrantChannel: Send + Sync {
 }
 
 /// The degenerate form of the coordinator: the allocation table, the allocator
-/// and the control loop in the proxy's own process, granting to that proxy.
+/// and the control loop in the node's own process, granting to the proxies that
+/// node runs.
 #[derive(Debug)]
 pub struct InProcessCoordinator<A> {
     proxy: ProxyId,
     allocator: A,
     release_delay: Duration,
     state: Mutex<State>,
-    grants: watch::Sender<GrantSet>,
     /// Ticks once per report. A setting that waits for the proxies to
     /// converge is woken by it, since a report is the only thing that tells
     /// the coordinator a connection is gone.
@@ -127,12 +128,35 @@ struct State {
     table: AllocationTable,
     budgets: BTreeMap<InstanceId, InstanceBudget>,
     policies: Policies,
+    generation: u64,
+    now: Option<Instant>,
+    proxies: BTreeMap<ProxyId, ProxyState>,
+}
+
+#[derive(Debug)]
+struct ProxyState {
+    grants: watch::Sender<GrantSet>,
     demand: BTreeMap<Slot, u32>,
     held: BTreeMap<Slot, Held>,
-    generation: u64,
     departed: bool,
-    now: Option<Instant>,
     idle_since: BTreeMap<Slot, Instant>,
+}
+
+impl ProxyState {
+    fn new() -> Self {
+        let (grants, _) = watch::channel(GrantSet::default());
+        Self {
+            grants,
+            demand: BTreeMap::new(),
+            held: BTreeMap::new(),
+            departed: false,
+            idle_since: BTreeMap::new(),
+        }
+    }
+
+    fn occupied(&self, slot: &Slot) -> u32 {
+        self.held.get(slot).map_or(0, |held| held.occupied)
+    }
 }
 
 /// How many connections a holder may still have on the instance.
@@ -146,18 +170,30 @@ struct Held {
     occupied: u32,
 }
 
-impl<A: Allocator<Holder>> InProcessCoordinator<A> {
+impl<A: Allocator<TenantId>> InProcessCoordinator<A> {
     #[must_use]
     pub fn new(proxy: ProxyId, allocator: A) -> Self {
-        let (grants, _) = watch::channel(GrantSet::default());
         let (reports, _) = watch::channel(0);
+        let mut state = State::default();
+        state.proxies.insert(proxy.clone(), ProxyState::new());
         Self {
             proxy,
             allocator,
             release_delay: Duration::ZERO,
-            state: Mutex::new(State::default()),
-            grants,
+            state: Mutex::new(state),
             reports,
+        }
+    }
+
+    #[must_use]
+    pub fn channel(self: &Arc<Self>, proxy: ProxyId) -> ProxyChannel<A> {
+        self.lock()
+            .proxies
+            .entry(proxy.clone())
+            .or_insert_with(ProxyState::new);
+        ProxyChannel {
+            coordinator: Arc::clone(self),
+            proxy,
         }
     }
 
@@ -292,19 +328,22 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         state.occupied_on(instance) <= budget
     }
 
-    /// Gives every grant this proxy holds back to its instances, and leaves it
-    /// granted nothing from then on.
+    /// Gives every grant the proxy this coordinator was created for holds back
+    /// to its instances, and leaves it granted nothing from then on.
     ///
     /// A proxy that is stopping calls it once the connections behind those
     /// grants are closed. From this moment the slots are free for another
     /// holder to open into, so a proxy that still held its connections would
     /// put the instance over its total budget.
     pub fn withdraw(&self) {
-        {
-            let mut state = self.lock();
-            state.departed = true;
-            state.demand.clear();
-            state.held.clear();
+        self.withdraw_proxy(&self.proxy);
+    }
+
+    fn withdraw_proxy(&self, proxy: &ProxyId) {
+        if let Some(departing) = self.lock().proxies.get_mut(proxy) {
+            departing.departed = true;
+            departing.demand.clear();
+            departing.held.clear();
         }
         if let Err(error) = self.reconcile() {
             tracing::error!(%error, "the desired state was rejected by the allocation table");
@@ -323,32 +362,39 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
 
     pub fn reconcile(&self) -> Result<(), PreconditionError> {
         let mut state = self.lock();
-        self.track_idle(&mut state);
+        state.track_idle();
         let entry = self.desired_state(&state);
-        let previous = self.published(&state.table);
+        let previous = published_by_proxy(&state);
         state.table.apply(&entry)?;
-        let next = self.published(&state.table);
+        let next = published_by_proxy(&state);
         if next == previous {
             return Ok(());
         }
         state.generation += 1;
         let generation = state.generation;
-        for slot in previous.keys().chain(next.keys()) {
-            let before = previous.get(slot).copied().unwrap_or(0);
-            let after = next.get(slot).copied().unwrap_or(0);
-            if before != after {
-                let held = state.held.entry(slot.clone()).or_default();
-                held.changed_at = generation;
-                held.occupied = held.occupied.max(after);
+        for (proxy, proxy_state) in &mut state.proxies {
+            let before = previous.get(proxy).cloned().unwrap_or_default();
+            let after = next.get(proxy).cloned().unwrap_or_default();
+            if before == after {
+                continue;
             }
+            for slot in before.keys().chain(after.keys()) {
+                let was = before.get(slot).copied().unwrap_or(0);
+                let now = after.get(slot).copied().unwrap_or(0);
+                if was != now {
+                    let held = proxy_state.held.entry(slot.clone()).or_default();
+                    held.changed_at = generation;
+                    held.occupied = held.occupied.max(now);
+                }
+            }
+            proxy_state
+                .held
+                .retain(|slot, held| held.occupied > 0 || after.contains_key(slot));
+            proxy_state.grants.send_replace(GrantSet {
+                generation,
+                grants: after,
+            });
         }
-        state
-            .held
-            .retain(|slot, held| held.occupied > 0 || next.contains_key(slot));
-        self.grants.send_replace(GrantSet {
-            generation,
-            grants: next,
-        });
         Ok(())
     }
 
@@ -365,38 +411,43 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         let mut entry = Entry::new();
         for (instance, derived) in &state.budgets {
             let budget = derived.current().total();
-            if state.departed {
-                entry = entry.instance(instance.clone(), Desired::new(budget));
-                continue;
-            }
-            let tenants: BTreeSet<&TenantId> = state
-                .demand
-                .keys()
-                .chain(state.held.keys())
-                .filter(|(of, _)| of == instance)
-                .map(|(_, tenant)| tenant)
-                .collect();
-            let claims = self.claims(state, instance, &tenants);
+            let holders = holders_on(state, instance);
+            let tenants: BTreeSet<&TenantId> = holders.keys().copied().collect();
+            let claims = self.claims(state, instance, &holders);
             let targets = self.allocator.allocate(budget, &claims);
-            let occupied: u32 = tenants
-                .iter()
-                .map(|tenant| state.occupied(instance, tenant))
-                .sum();
-            let mut available = budget.saturating_sub(occupied);
+            let mut available = budget.saturating_sub(state.occupied_on(instance));
             let mut desired = Desired::new(budget);
             for tenant in tenants {
-                let holder = self.holder(tenant);
-                let current = state.table.granted(instance, &holder);
-                let target = targets.get(&holder);
-                let granted = if target <= current {
-                    target
-                } else {
-                    let occupied = state.occupied(instance, tenant);
-                    let granted = target.min(occupied + available);
-                    available -= granted.saturating_sub(occupied);
-                    granted
-                };
-                desired = desired.grant(holder, granted);
+                let proxies = &holders[tenant];
+                let slot = (instance.clone(), tenant.clone());
+                let shares: Vec<Share<ProxyId>> = proxies
+                    .iter()
+                    .map(|proxy| Share {
+                        key: (*proxy).clone(),
+                        demand: state.proxies[*proxy]
+                            .demand
+                            .get(&slot)
+                            .copied()
+                            .unwrap_or(0),
+                        current: state
+                            .table
+                            .granted(instance, &Holder::new(tenant.clone(), (*proxy).clone())),
+                        may_release: false,
+                    })
+                    .collect();
+                let split = split(targets.get(tenant), &shares);
+                for share in shares {
+                    let target = split.get(&share.key).copied().unwrap_or(0);
+                    let granted = if target <= share.current {
+                        target
+                    } else {
+                        let occupied = state.proxies[&share.key].occupied(&slot);
+                        let granted = target.min(occupied + available);
+                        available -= granted.saturating_sub(occupied);
+                        granted
+                    };
+                    desired = desired.grant(Holder::new(tenant.clone(), share.key), granted);
+                }
             }
             entry = entry.instance(instance.clone(), desired);
         }
@@ -407,63 +458,79 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
         &self,
         state: &State,
         instance: &InstanceId,
-        tenants: &BTreeSet<&TenantId>,
-    ) -> Vec<Claim<Holder>> {
-        tenants
+        holders: &BTreeMap<&TenantId, Vec<&ProxyId>>,
+    ) -> Vec<Claim<TenantId>> {
+        holders
             .iter()
-            .filter_map(|tenant| {
+            .filter_map(|(tenant, proxies)| {
                 let policy = state.policies.policy(instance, tenant)?;
-                let holder = self.holder(tenant);
+                let slot = (instance.clone(), (*tenant).clone());
+                let mut demand = 0u32;
+                let mut current = 0u32;
+                let mut may_release = true;
+                for proxy in proxies {
+                    let proxy_state = &state.proxies[*proxy];
+                    let wanted = proxy_state.demand.get(&slot).copied().unwrap_or(0);
+                    let granted = state
+                        .table
+                        .granted(instance, &Holder::new((*tenant).clone(), (*proxy).clone()));
+                    demand = demand.saturating_add(wanted);
+                    current = current.saturating_add(granted);
+                    if granted > wanted && !self.may_release(state, proxy_state, &slot) {
+                        may_release = false;
+                    }
+                }
                 Some(Claim {
                     min: policy.min,
                     max: policy.max,
                     weight: policy.weight,
-                    demand: state
-                        .demand
-                        .get(&(instance.clone(), (*tenant).clone()))
-                        .copied()
-                        .unwrap_or(0),
-                    current: state.table.granted(instance, &holder),
-                    may_release: self.may_release(state, instance, tenant),
-                    key: holder,
+                    demand,
+                    current,
+                    may_release,
+                    key: (*tenant).clone(),
                 })
             })
             .collect()
     }
 
-    fn track_idle(&self, state: &mut State) {
-        let Some(now) = state.now else {
-            return;
-        };
-        let idle: BTreeSet<Slot> = self
-            .published(&state.table)
-            .into_iter()
-            .filter(|(slot, granted)| state.demand.get(slot).copied().unwrap_or(0) < *granted)
-            .map(|(slot, _)| slot)
-            .collect();
-        state.idle_since.retain(|slot, _| idle.contains(slot));
-        for slot in idle {
-            state.idle_since.entry(slot).or_insert(now);
-        }
-    }
-
-    fn may_release(&self, state: &State, instance: &InstanceId, tenant: &TenantId) -> bool {
-        let slot = (instance.clone(), tenant.clone());
-        match (state.now, state.idle_since.get(&slot)) {
+    fn may_release(&self, state: &State, proxy_state: &ProxyState, slot: &Slot) -> bool {
+        match (state.now, proxy_state.idle_since.get(slot)) {
             (Some(now), Some(since)) => now.duration_since(*since) >= self.release_delay,
             _ => true,
         }
     }
 
-    fn published(&self, table: &AllocationTable) -> BTreeMap<Slot, u32> {
-        table
-            .grants_for(&self.proxy)
-            .map(|(instance, tenant, slots)| ((instance.clone(), tenant.clone()), slots))
-            .collect()
+    fn subscribe(&self, proxy: &ProxyId) -> watch::Receiver<GrantSet> {
+        self.lock().proxies.get(proxy).map_or_else(
+            || watch::channel(GrantSet::default()).1,
+            |state| state.grants.subscribe(),
+        )
     }
 
-    fn holder(&self, tenant: &TenantId) -> Holder {
-        Holder::new(tenant.clone(), self.proxy.clone())
+    fn report_for(&self, proxy: &ProxyId, report: &Report) {
+        let mut state = self.lock();
+        let granted = published(&state.table, proxy);
+        let Some(proxy_state) = state.proxies.get_mut(proxy) else {
+            return;
+        };
+        proxy_state.demand = report
+            .usage
+            .iter()
+            .map(|(slot, usage)| (slot.clone(), usage.demand))
+            .collect();
+        for (slot, held) in &mut proxy_state.held {
+            if report.generation >= held.changed_at {
+                let actual = report.get(&slot.0, &slot.1).actual;
+                let grant = granted.get(slot).copied().unwrap_or(0);
+                held.occupied = grant.max(actual);
+            }
+        }
+        proxy_state
+            .held
+            .retain(|slot, held| held.occupied > 0 || granted.contains_key(slot));
+        drop(state);
+        self.reports
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -472,46 +539,107 @@ impl<A: Allocator<Holder>> InProcessCoordinator<A> {
 }
 
 impl State {
-    fn occupied(&self, instance: &InstanceId, tenant: &TenantId) -> u32 {
-        self.held
-            .get(&(instance.clone(), tenant.clone()))
-            .map_or(0, |held| held.occupied)
+    fn track_idle(&mut self) {
+        let Some(now) = self.now else {
+            return;
+        };
+        let table = &self.table;
+        for (proxy, proxy_state) in &mut self.proxies {
+            let idle: BTreeSet<Slot> = published(table, proxy)
+                .into_iter()
+                .filter(|(slot, granted)| {
+                    proxy_state.demand.get(slot).copied().unwrap_or(0) < *granted
+                })
+                .map(|(slot, _)| slot)
+                .collect();
+            proxy_state.idle_since.retain(|slot, _| idle.contains(slot));
+            for slot in idle {
+                proxy_state.idle_since.entry(slot).or_insert(now);
+            }
+        }
     }
 
     fn occupied_on(&self, instance: &InstanceId) -> u32 {
-        self.held
-            .iter()
+        self.proxies
+            .values()
+            .flat_map(|proxy| proxy.held.iter())
             .filter(|((of, _), _)| of == instance)
             .map(|(_, held)| held.occupied)
             .fold(0, u32::saturating_add)
     }
 }
 
-impl<A: Allocator<Holder> + Send + Sync> GrantChannel for InProcessCoordinator<A> {
+fn holders_on<'a>(
+    state: &'a State,
+    instance: &InstanceId,
+) -> BTreeMap<&'a TenantId, Vec<&'a ProxyId>> {
+    let mut holders: BTreeMap<&TenantId, Vec<&ProxyId>> = BTreeMap::new();
+    for (proxy, proxy_state) in &state.proxies {
+        if proxy_state.departed {
+            continue;
+        }
+        let tenants: BTreeSet<&TenantId> = proxy_state
+            .demand
+            .keys()
+            .chain(proxy_state.held.keys())
+            .filter(|(of, _)| of == instance)
+            .map(|(_, tenant)| tenant)
+            .collect();
+        for tenant in tenants {
+            holders.entry(tenant).or_default().push(proxy);
+        }
+    }
+    holders
+}
+
+fn published(table: &AllocationTable, proxy: &ProxyId) -> BTreeMap<Slot, u32> {
+    table
+        .grants_for(proxy)
+        .map(|(instance, tenant, slots)| ((instance.clone(), tenant.clone()), slots))
+        .collect()
+}
+
+fn published_by_proxy(state: &State) -> BTreeMap<ProxyId, BTreeMap<Slot, u32>> {
+    state
+        .proxies
+        .keys()
+        .map(|proxy| (proxy.clone(), published(&state.table, proxy)))
+        .collect()
+}
+
+impl<A: Allocator<TenantId> + Send + Sync> GrantChannel for InProcessCoordinator<A> {
     fn grants(&self) -> watch::Receiver<GrantSet> {
-        self.grants.subscribe()
+        self.subscribe(&self.proxy)
     }
 
     fn report(&self, report: Report) {
-        let mut state = self.lock();
-        state.demand = report
-            .usage
-            .iter()
-            .map(|(slot, usage)| (slot.clone(), usage.demand))
-            .collect();
-        let granted = self.published(&state.table);
-        for (slot, held) in &mut state.held {
-            if report.generation >= held.changed_at {
-                let actual = report.get(&slot.0, &slot.1).actual;
-                let grant = granted.get(slot).copied().unwrap_or(0);
-                held.occupied = grant.max(actual);
-            }
-        }
-        state
-            .held
-            .retain(|slot, held| held.occupied > 0 || granted.contains_key(slot));
-        drop(state);
-        self.reports
-            .send_modify(|count| *count = count.wrapping_add(1));
+        self.report_for(&self.proxy, &report);
+    }
+}
+
+#[derive(Debug)]
+pub struct ProxyChannel<A> {
+    coordinator: Arc<InProcessCoordinator<A>>,
+    proxy: ProxyId,
+}
+
+impl<A: Allocator<TenantId>> ProxyChannel<A> {
+    #[must_use]
+    pub fn proxy(&self) -> &ProxyId {
+        &self.proxy
+    }
+
+    pub fn withdraw(&self) {
+        self.coordinator.withdraw_proxy(&self.proxy);
+    }
+}
+
+impl<A: Allocator<TenantId> + Send + Sync> GrantChannel for ProxyChannel<A> {
+    fn grants(&self) -> watch::Receiver<GrantSet> {
+        self.coordinator.subscribe(&self.proxy)
+    }
+
+    fn report(&self, report: Report) {
+        self.coordinator.report_for(&self.proxy, &report);
     }
 }
