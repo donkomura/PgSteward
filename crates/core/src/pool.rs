@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
-use std::ops::{Deref, DerefMut};
+use std::ops::{AddAssign, Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -107,6 +107,18 @@ impl PoolStats {
     #[must_use]
     pub fn demand(&self) -> usize {
         self.waiting + self.in_use + self.opening
+    }
+}
+
+impl AddAssign for PoolStats {
+    fn add_assign(&mut self, other: Self) {
+        self.slots += other.slots;
+        self.idle += other.idle;
+        self.in_use += other.in_use;
+        self.opening += other.opening;
+        self.closing += other.closing;
+        self.waiting += other.waiting;
+        self.opened += other.opened;
     }
 }
 

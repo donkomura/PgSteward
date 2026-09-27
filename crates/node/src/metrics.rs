@@ -2,7 +2,7 @@ use std::fmt;
 use std::io;
 
 use pgsteward_core::budget::TotalBudget;
-use pgsteward_core::console::{ConsoleNode, ConsoleView, PoolSnapshot};
+use pgsteward_core::console::{ConsoleNode, ConsoleView, NodePool};
 use pgsteward_core::rt::{Listener, Runtime};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
@@ -125,10 +125,7 @@ fn encode_grants(encoder: &mut DescriptorEncoder, view: &ConsoleView) -> Result<
 /// What this node actually holds against those grants, and what is waiting on
 /// it.
 fn encode_pools(encoder: &mut DescriptorEncoder, view: &ConsoleView) -> Result<(), fmt::Error> {
-    let mut pools: Vec<&PoolSnapshot> = view.pools.iter().collect();
-    pools.sort_by(|left, right| {
-        (&left.instance, &left.tenant).cmp(&(&right.instance, &right.tenant))
-    });
+    let pools = view.node_pools();
 
     gauges(
         encoder,
@@ -227,7 +224,7 @@ fn encode_instances(encoder: &mut DescriptorEncoder, view: &ConsoleView) -> Resu
     Ok(())
 }
 
-fn labels_of(pool: &PoolSnapshot) -> PoolLabels {
+fn labels_of(pool: &NodePool) -> PoolLabels {
     PoolLabels {
         instance: pool.instance.to_string(),
         database: pool.tenant.database().to_owned(),
