@@ -87,6 +87,22 @@ fn a_proxy_within_its_release_delay_keeps_a_grant_above_its_demand() {
 }
 
 #[test]
+fn a_proxy_within_its_release_delay_gives_way_to_another_proxy_that_has_clients_waiting() {
+    let granted = split(1, &[retained(share(1, 0, 1)), share(2, 1, 0)]);
+
+    assert_eq!(of(&granted, 1), 0);
+    assert_eq!(of(&granted, 2), 1);
+}
+
+#[test]
+fn a_proxy_within_its_release_delay_keeps_what_the_others_do_not_ask_for() {
+    let granted = split(3, &[retained(share(1, 0, 3)), share(2, 1, 0)]);
+
+    assert_eq!(of(&granted, 1), 2);
+    assert_eq!(of(&granted, 2), 1);
+}
+
+#[test]
 fn a_proxy_past_its_release_delay_gives_up_what_it_does_not_use() {
     let granted = split(5, &[share(1, 0, 2), share(2, 5, 0)]);
 
@@ -128,14 +144,24 @@ proptest! {
     }
 
     #[test]
-    fn no_slot_moves_while_the_grant_covers_what_is_kept(granted in 0u32..100, shares in shares()) {
+    fn no_slot_moves_while_the_grant_covers_what_is_kept_and_what_is_still_asked_for(granted in 0u32..100, shares in shares()) {
         let kept: u32 = shares.iter().map(|share| share.current.min(share.need())).sum();
-        prop_assume!(granted >= kept);
+        let unmet: u32 = shares.iter().map(|share| share.demand.saturating_sub(share.current)).sum();
+        prop_assume!(granted >= kept + unmet);
         let split = split(granted, &shares);
 
         for share in &shares {
             prop_assert!(of(&split, share.key) >= share.current.min(share.need()));
         }
+    }
+
+    #[test]
+    fn a_slot_kept_beyond_demand_never_leaves_another_proxy_short(granted in 0u32..100, shares in shares()) {
+        let split = split(granted, &shares);
+        let short = shares.iter().any(|share| of(&split, share.key) < share.demand);
+        let kept_idle = shares.iter().any(|share| of(&split, share.key) > share.demand);
+
+        prop_assert!(!(short && kept_idle), "{split:?}");
     }
 
     #[test]

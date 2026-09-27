@@ -10,3 +10,4 @@ cc e66d590e1bdc75dfb746f6251181eca2869507fd27b2ea1135b013ca95fbd408 # shrinks to
 cc ab9b16701552425f2734485376c6ce1c37977a2ffcac8a55856d5f1aa678248b # shrinks to granted = 1, shares = []
 cc 9a5cefaa9473c6e094354c1a904bb018c653768d605c9a2f32d42bf7395cbdb4 # shrinks to granted = 1, shares = []
 cc ca2c02b387ed73dc4f6891dbe58dd05b7519cd1dcbefb36a90e9a1223d952bcf # shrinks to granted = 1, shares = []
+cc c2e9e36e9996be759d7beba468b92a3a0ef756a8bbbc8ed2ef8fe28f2bbaeebf # shrinks to granted = 8, shares = [Share { key: 0, demand: 0, current: 1, may_release: false }, Share { key: 1, demand: 8, current: 0, may_release: false }]

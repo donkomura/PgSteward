@@ -24,37 +24,48 @@ pub fn split<K: Ord + Clone>(granted: u32, shares: &[Share<K>]) -> BTreeMap<K, u
     order.sort_by(|a, b| a.key.cmp(&b.key));
     let mut given: Vec<u32> = order
         .iter()
-        .map(|share| share.current.min(share.need()))
+        .map(|share| share.current.min(share.demand))
         .collect();
-    let mut total: u64 = given.iter().copied().map(u64::from).sum();
+    let mut total = sum(&given);
     let granted = u64::from(granted);
     while total > granted {
-        let excess = order
-            .iter()
-            .zip(&given)
-            .map(|(share, given)| given.saturating_sub(share.demand));
-        let Some(most) = first_max(excess).or_else(|| first_max(given.iter().copied())) else {
+        let Some(most) = first_max(given.iter().copied()) else {
             break;
         };
         given[most] -= 1;
         total -= 1;
     }
+    give_up_to(granted, &order, &mut given, |share| share.demand);
+    give_up_to(granted, &order, &mut given, Share::need);
+    order
+        .into_iter()
+        .zip(given)
+        .map(|(share, given)| (share.key.clone(), given))
+        .collect()
+}
+
+fn give_up_to<K>(
+    granted: u64,
+    order: &[&Share<K>],
+    given: &mut [u32],
+    wanted: impl Fn(&Share<K>) -> u32,
+) {
+    let mut total = sum(given);
     while total < granted {
         let shortfalls = order
             .iter()
-            .zip(&given)
-            .map(|(share, given)| share.need() - given);
+            .zip(given.iter())
+            .map(|(share, given)| wanted(share).saturating_sub(*given));
         let Some(furthest) = first_max(shortfalls) else {
             break;
         };
         given[furthest] += 1;
         total += 1;
     }
-    order
-        .into_iter()
-        .zip(given)
-        .map(|(share, given)| (share.key.clone(), given))
-        .collect()
+}
+
+fn sum(given: &[u32]) -> u64 {
+    given.iter().copied().map(u64::from).sum()
 }
 
 fn first_max(values: impl Iterator<Item = u32>) -> Option<usize> {
