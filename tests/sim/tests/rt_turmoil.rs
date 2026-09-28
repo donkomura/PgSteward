@@ -46,3 +46,21 @@ fn net_resolves_host_names_inside_simulation() {
 
     sim.run().unwrap();
 }
+
+#[test]
+fn a_worker_runs_inside_the_simulation() {
+    let mut sim = turmoil::Builder::new().build();
+    sim.client("app", async {
+        let rt = TurmoilRuntime::new();
+        let (report, reported) = tokio::sync::oneshot::channel();
+        rt.spawn_worker("worker".to_owned(), async move {
+            TurmoilRuntime::new().sleep(Duration::from_secs(1)).await;
+            let _ = report.send(());
+        })?;
+        let before = rt.now();
+        reported.await?;
+        assert_eq!(rt.now().duration_since(before), Duration::from_secs(1));
+        Ok(())
+    });
+    sim.run().unwrap();
+}

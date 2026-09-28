@@ -23,6 +23,12 @@ pub trait Spawner: Clone + Send + Sync + 'static {
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static;
+
+    /// Runs `future` as a worker: apart from the caller's tasks, with every
+    /// task it spawns kept beside it. The worker ends when `future` does.
+    fn spawn_worker<F>(&self, name: String, future: F) -> io::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static;
 }
 
 pub trait Listener: Send + Sync + 'static {
