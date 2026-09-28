@@ -270,9 +270,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
 
     pub async fn read_frame(&mut self) -> io::Result<Option<Frame>> {
         loop {
-            if let Some(frame) = decode_frame(&mut self.read_buf, MAX_MESSAGE)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-            {
+            if let Some(frame) = self.buffered_frame()? {
                 return Ok(Some(frame));
             }
             self.read_buf.reserve(READ_CHUNK);
@@ -280,6 +278,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerConnection<S> {
                 return Ok(None);
             }
         }
+    }
+
+    /// The next message the server has already sent, if all of it has been
+    /// read. It waits for nothing.
+    pub fn buffered_frame(&mut self) -> io::Result<Option<Frame>> {
+        decode_frame(&mut self.read_buf, MAX_MESSAGE)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     pub async fn forward(&mut self, bytes: &[u8]) -> io::Result<()> {

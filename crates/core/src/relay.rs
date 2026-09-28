@@ -112,20 +112,43 @@ where
             Event::FromClient(_) => {}
             Event::FromServer(None) => return Err(RelayError::ServerClosed),
             Event::FromServer(Some(frame)) => {
-                let ready = match BackendTag::try_from(frame.tag) {
-                    Ok(tag) => tracker.on_backend(tag, &frame.body)?.is_some(),
-                    Err(_) => false,
-                };
                 let mut out = BytesMut::new();
-                encode_frame(frame.tag, &frame.body, &mut out);
+                let released = relay_replies(frame, server, &mut tracker, &mut out)?;
                 client.write_all(&out).await?;
                 client.flush().await?;
-                if ready && tracker.may_release() {
+                if released {
                     return Ok(Boundary::Released);
                 }
             }
         }
     }
+}
+
+/// Copies `first` and every whole message the server sent after it into
+/// `out`, so that one write carries them all to the client, and answers
+/// whether they reached the boundary where the assignment may be released.
+///
+/// What the server sent after that boundary is left unread: it belongs to
+/// whichever client is assigned the connection next.
+fn relay_replies<S: AsyncRead + AsyncWrite + Unpin>(
+    first: Frame,
+    server: &mut ServerConnection<S>,
+    tracker: &mut ReadyTracker,
+    out: &mut BytesMut,
+) -> Result<bool, RelayError> {
+    let mut next = Some(first);
+    while let Some(frame) = next {
+        let ready = match BackendTag::try_from(frame.tag) {
+            Ok(tag) => tracker.on_backend(tag, &frame.body)?.is_some(),
+            Err(_) => false,
+        };
+        encode_frame(frame.tag, &frame.body, out);
+        if ready && tracker.may_release() {
+            return Ok(true);
+        }
+        next = server.buffered_frame()?;
+    }
+    Ok(false)
 }
 
 enum Event {
