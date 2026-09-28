@@ -1,4 +1,8 @@
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
@@ -19,7 +23,9 @@ use pgsteward_protocol::startup::{
     CancelKey, ProtocolVersion, StartupMessage, StartupRequest, decode_startup, encode_startup,
 };
 use postgres_protocol::message::backend::{ErrorResponseBody, Message};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
+};
 use tokio::task::JoinHandle;
 
 const MAX_FRAME: usize = 1 << 20;
@@ -496,6 +502,89 @@ async fn a_simple_query_releases_the_assignment_when_the_server_reports_idle() {
     assert!(matches!(client.read_message().await, Message::DataRow(_)));
     expect_complete(&mut client).await;
     expect_ready(&mut client, b'I').await;
+}
+
+/// The proxy's side of a client connection, counting the writes made to it.
+struct CountingWrites {
+    stream: DuplexStream,
+    writes: Arc<AtomicUsize>,
+}
+
+impl AsyncRead for CountingWrites {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for CountingWrites {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn a_reply_the_server_sends_at_once_reaches_the_client_in_one_write() {
+    let (mut client, proxy) = client_link();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut proxy = CountingWrites {
+        stream: proxy,
+        writes: Arc::clone(&writes),
+    };
+    let (mut backend, mut server) = server_connection().await;
+    let assignment = tokio::spawn(async move {
+        let mut pending = BytesMut::new();
+        serve_assignment(&mut proxy, &mut pending, &mut server).await
+    });
+
+    client.send(&query_frame("SELECT 1")).await;
+    expect_query(&mut backend, "SELECT 1").await;
+    backend.send(&select_one_result()).await;
+
+    assert_eq!(assignment.await.unwrap().unwrap(), Boundary::Released);
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        client.read_message().await,
+        Message::RowDescription(_)
+    ));
+    assert!(matches!(client.read_message().await, Message::DataRow(_)));
+    expect_complete(&mut client).await;
+    expect_ready(&mut client, b'I').await;
+}
+
+#[tokio::test]
+async fn what_the_server_sends_after_the_boundary_stays_for_the_next_client() {
+    let (mut client, proxy) = client_link();
+    let (mut backend, server) = server_connection().await;
+    let assignment = spawn_assignment(proxy, BytesMut::new(), server);
+
+    client.send(&query_frame("SELECT 1")).await;
+    expect_query(&mut backend, "SELECT 1").await;
+    backend
+        .send(&[select_one_result(), parameter_status("TimeZone", "UTC")].concat())
+        .await;
+
+    let (boundary, _pending, mut server) = assignment.await.unwrap();
+    assert_eq!(boundary.unwrap(), Boundary::Released);
+    expect_client_frames(&mut client, b"TDCZ").await;
+    let left = server.read_frame().await.unwrap().unwrap();
+    assert_eq!(left.tag, b'S');
 }
 
 #[tokio::test]
