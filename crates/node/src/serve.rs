@@ -30,6 +30,7 @@ use pgsteward_protocol::backend::{ErrorResponse, encode_error_response, sqlstate
 use pgsteward_protocol::startup::CancelKey;
 use pgsteward_sched::fair::WeightedMaxMinFair;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{oneshot, watch};
 
 use crate::config::{ClusterConfig, ConfigError, NodeConfig, PoolMode};
 use crate::metrics::serve_scrapes;
@@ -84,6 +85,8 @@ pub enum ServeError {
     },
     #[error("cannot listen on {addr}: {source}")]
     Listen { addr: SocketAddr, source: io::Error },
+    #[error("cannot start the proxy's thread: {0}")]
+    Worker(io::Error),
 }
 
 type NodePools<R> = ProxyPools<InstanceOpener<R>, R>;
@@ -98,7 +101,16 @@ pub struct Stopped {
     pub held: usize,
 }
 
-/// A node that is serving. Dropping it stops every task it started.
+/// How far a node has gone in stopping, as its proxy's thread reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Serving,
+    Closing,
+    Draining,
+}
+
+/// A node that is serving. Dropping it stops every task it started, and the
+/// proxy's thread with them.
 pub struct Serving<R: Runtime> {
     rt: R,
     addr: SocketAddr,
@@ -107,7 +119,8 @@ pub struct Serving<R: Runtime> {
     grace: Duration,
     coordinator: Arc<Coordinator>,
     pools: Arc<NodePools<R>>,
-    accepting: JoinHandle<()>,
+    stage: watch::Sender<Stage>,
+    drained: watch::Receiver<Option<Stopped>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -154,10 +167,10 @@ impl<R: Runtime> Serving<R> {
     /// more, and every connection it closes from here is closed by the stop
     /// itself, in one place.
     pub async fn shutdown(&self) -> Stopped {
-        self.accepting.abort();
         for task in &self.tasks {
             task.abort();
         }
+        self.stage.send_replace(Stage::Closing);
         tracing::info!("stopping: this node takes no further client");
         tokio::select! {
             () = self.limit.drained() => {
@@ -170,8 +183,20 @@ impl<R: Runtime> Serving<R> {
                 );
             }
         }
-        let closed = self.pools.drain().await;
-        let held = self.pools.occupied();
+        self.stage.send_replace(Stage::Draining);
+        let mut drained = self.drained.clone();
+        let Ok(Some(Stopped { closed, held })) = drained
+            .wait_for(Option::is_some)
+            .await
+            .map(|stopped| *stopped)
+        else {
+            let held = self.pools.occupied();
+            tracing::warn!(
+                held,
+                "stopped: the proxy ended before it drained, so its grants are left to expire"
+            );
+            return Stopped { closed: 0, held };
+        };
         if held == 0 {
             self.coordinator.withdraw();
             tracing::info!(closed, "stopped: every grant is back with its instance");
@@ -188,7 +213,6 @@ impl<R: Runtime> Serving<R> {
 
 impl<R: Runtime> Drop for Serving<R> {
     fn drop(&mut self) {
-        self.accepting.abort();
         for task in &self.tasks {
             task.abort();
         }
@@ -207,6 +231,12 @@ impl<R: Runtime> std::fmt::Debug for Serving<R> {
 /// Runs the degenerate form of the system in one process: the coordinator
 /// derives each instance's total budget and computes the grants, and the proxy
 /// accepts clients and converges its pools to those grants.
+///
+/// The proxy and the coordinator's arbitration run on a thread of their own
+/// with a single-threaded runtime; only the observers of the instances stay on
+/// the runtime the node is started from. A client's request and the server's
+/// reply then wake tasks on one thread, rather than hopping between the threads
+/// of a shared runtime on every round trip.
 pub async fn serve<R: Runtime>(
     rt: R,
     node: NodeConfig,
@@ -248,31 +278,9 @@ pub async fn serve<R: Runtime>(
 
     let interval = cluster.cluster.arbitration_interval;
     let pools = Arc::new(NodePools::<R>::new());
-    tasks.push(rt.spawn({
-        let coordinator = Arc::clone(&coordinator);
-        let rt = rt.clone();
-        async move { coordinator.run(&rt, interval).await }
-    }));
-    tasks.push(rt.spawn({
-        let pools = Arc::clone(&pools);
-        let coordinator = Arc::clone(&coordinator);
-        let rt = rt.clone();
-        async move { pools.run(coordinator.as_ref(), &rt, interval).await }
-    }));
 
     let listen = node.node.listen;
     let node_metrics_listen = node.node.metrics_listen;
-    let listener = rt
-        .bind(&listen.to_string())
-        .await
-        .map_err(|source| ServeError::Listen {
-            addr: listen,
-            source,
-        })?;
-    let addr = listener.local_addr().map_err(|source| ServeError::Listen {
-        addr: listen,
-        source,
-    })?;
     let limit = node.client_limit();
     let front = Front {
         rt: rt.clone(),
@@ -293,7 +301,21 @@ pub async fn serve<R: Runtime>(
         Some(listen) => Some(publish_metrics(&rt, listen, front.clone(), &mut tasks).await?),
         None => None,
     };
-    let accepting = rt.spawn(front.accept(listener));
+    let (stage, _) = watch::channel(Stage::Serving);
+    let (bound, binding) = oneshot::channel();
+    let (done, drained) = watch::channel(None);
+    rt.spawn_worker(
+        "pgsteward-proxy".to_owned(),
+        front.work(listen, bound, stage.subscribe(), done, interval),
+    )
+    .map_err(ServeError::Worker)?;
+    let addr = binding
+        .await
+        .unwrap_or_else(|_| Err(io::Error::other("the proxy ended before it listened")))
+        .map_err(|source| ServeError::Listen {
+            addr: listen,
+            source,
+        })?;
 
     Ok(Serving {
         rt,
@@ -303,7 +325,8 @@ pub async fn serve<R: Runtime>(
         grace: options.shutdown_grace,
         coordinator,
         pools,
-        accepting,
+        stage,
+        drained,
         tasks,
     })
 }
@@ -489,6 +512,77 @@ impl<R: Runtime> Clone for Front<R> {
 }
 
 impl<R: Runtime> Front<R> {
+    /// Runs the proxy on its own thread: it listens on `listen`, arbitrates and
+    /// converges its pools to the grants, and follows the node through `stage`
+    /// as it stops.
+    ///
+    /// The coordinator's arbitration runs on this thread too, so that how soon
+    /// a client's demand is granted depends on this node alone, and not on
+    /// whatever else runs on the runtime the node was started from.
+    ///
+    /// The server connections the proxy opens belong to this thread's runtime,
+    /// so it is this thread that closes them, and it reports what that left
+    /// through `drained`. It then keeps the sessions it still serves until the
+    /// node is dropped.
+    async fn work(
+        self,
+        listen: SocketAddr,
+        bound: oneshot::Sender<io::Result<SocketAddr>>,
+        mut stage: watch::Receiver<Stage>,
+        drained: watch::Sender<Option<Stopped>>,
+        interval: Duration,
+    ) {
+        let listening = match self.rt.bind(&listen.to_string()).await {
+            Ok(listener) => listener.local_addr().map(|addr| (listener, addr)),
+            Err(error) => Err(error),
+        };
+        let listener = match listening {
+            Ok((listener, addr)) => {
+                let _ = bound.send(Ok(addr));
+                listener
+            }
+            Err(error) => {
+                let _ = bound.send(Err(error));
+                return;
+            }
+        };
+        let pools = Arc::clone(&self.pools);
+        let rt = self.rt.clone();
+        let arbitrating = rt.spawn({
+            let coordinator = Arc::clone(&self.coordinator);
+            let rt = rt.clone();
+            async move { coordinator.run(&rt, interval).await }
+        });
+        let converging = rt.spawn({
+            let pools = Arc::clone(&pools);
+            let coordinator = Arc::clone(&self.coordinator);
+            let rt = rt.clone();
+            async move { pools.run(coordinator.as_ref(), &rt, interval).await }
+        });
+        let tasks = [arbitrating, converging, rt.spawn(self.accept(listener))];
+        let closing = stage
+            .wait_for(|stage| *stage != Stage::Serving)
+            .await
+            .is_ok();
+        for task in &tasks {
+            task.abort();
+        }
+        if !closing
+            || stage
+                .wait_for(|stage| *stage == Stage::Draining)
+                .await
+                .is_err()
+        {
+            return;
+        }
+        let closed = pools.drain().await;
+        drained.send_replace(Some(Stopped {
+            closed,
+            held: pools.occupied(),
+        }));
+        while stage.changed().await.is_ok() {}
+    }
+
     async fn accept(self, listener: R::Listener) {
         loop {
             match listener.accept().await {
