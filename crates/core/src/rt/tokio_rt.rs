@@ -35,6 +35,19 @@ impl Spawner for TokioRuntime {
     {
         tokio::spawn(future)
     }
+
+    fn spawn_worker<F>(&self, name: String, future: F) -> io::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(move || runtime.block_on(future))?;
+        Ok(())
+    }
 }
 
 impl Listener for TcpListener {

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use pgsteward_core::rt::{Clock, Listener, Net, Spawner, tokio_rt::TokioRuntime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::runtime::{Handle, RuntimeFlavor};
 
 #[tokio::test]
 async fn clock_sleep_advances_now() {
@@ -56,4 +57,28 @@ async fn net_streams_send_small_messages_without_waiting_to_coalesce() {
         server.nodelay().unwrap(),
         "an accepted stream disables Nagle"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_runs_on_a_thread_of_its_own_where_tasks_stay_on_that_thread() {
+    let rt = TokioRuntime::new();
+    let (report, reported) = tokio::sync::oneshot::channel();
+
+    rt.spawn_worker("pgsteward-worker".to_owned(), async move {
+        let spawned = TokioRuntime::new()
+            .spawn(async {
+                (
+                    std::thread::current().name().map(str::to_owned),
+                    Handle::current().runtime_flavor(),
+                )
+            })
+            .await
+            .unwrap();
+        let _ = report.send(spawned);
+    })
+    .unwrap();
+    let (thread, flavor) = reported.await.unwrap();
+
+    assert_eq!(thread.as_deref(), Some("pgsteward-worker"));
+    assert_eq!(flavor, RuntimeFlavor::CurrentThread);
 }
