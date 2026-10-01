@@ -1,7 +1,10 @@
 pub mod cap;
+#[cfg(feature = "turmoil")]
+pub mod cluster;
 pub mod fake_postgres;
 #[cfg(feature = "postgres")]
 pub mod pg_stat_activity;
+pub mod wire_client;
 
 use std::sync::Arc;
 

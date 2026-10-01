@@ -10,15 +10,20 @@ publish = false
 [features]
 default = []
 postgres = ["dep:tokio-postgres"]
+turmoil = ["dep:turmoil", "dep:pgsteward-node", "pgsteward-core/turmoil"]
 
 [dependencies]
 pgsteward-core.workspace = true
+pgsteward-node = { workspace = true, optional = true }
 pgsteward-protocol.workspace = true
 bytes.workspace = true
+fallible-iterator.workspace = true
+postgres-protocol.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres = { workspace = true, optional = true }
 tracing.workspace = true
+turmoil = { workspace = true, optional = true }
 
 [lints]
 workspace = true

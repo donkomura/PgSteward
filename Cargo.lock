@@ -1686,12 +1686,16 @@ name = "pgsteward-harness"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fallible-iterator",
  "pgsteward-core",
+ "pgsteward-node",
  "pgsteward-protocol",
+ "postgres-protocol",
  "thiserror",
  "tokio",
  "tokio-postgres",
  "tracing",
+ "turmoil",
 ]
 
 [[package]]

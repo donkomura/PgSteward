@@ -1,8 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
-use fallible_iterator::FallibleIterator;
 use pgsteward_core::allocation::InstanceId;
 use pgsteward_core::auth::TrustAll;
 use pgsteward_core::cancel::{CancelRegistry, ProxyTag};
@@ -14,15 +12,9 @@ use pgsteward_core::session::{Accepted, accept};
 use pgsteward_harness::cap::{CapMonitor, CapReport};
 use pgsteward_harness::fake_postgres::{FakePostgres, FakePostgresStats};
 use pgsteward_harness::server_tls;
-use pgsteward_protocol::framing::{Frame, decode_frame, encode_frame};
-use pgsteward_protocol::startup::{
-    CancelKey, ProtocolVersion, StartupMessage, StartupRequest, encode_startup,
-};
-use postgres_protocol::message::backend::Message;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use pgsteward_harness::wire_client::WireClient;
 
 const IDENTIFIER: &str = "sim-transaction-mode";
-const MAX_FRAME: usize = 1 << 20;
 const POLL: Duration = Duration::from_millis(1);
 const SEEDS: u64 = 40;
 const TOO_MANY_CONNECTIONS: &str = pgsteward_protocol::backend::sqlstate::TOO_MANY_CONNECTIONS;
@@ -84,120 +76,9 @@ fn start_proxy(sim: &mut turmoil::Sim<'_>, slots: usize, wait_timeout: Duration)
     });
 }
 
-struct WireClient<S> {
-    stream: S,
-    buf: BytesMut,
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> WireClient<S> {
-    async fn hello(stream: S) -> turmoil::Result<(Self, Vec<(String, String)>, CancelKey)> {
-        let mut client = Self {
-            stream,
-            buf: BytesMut::new(),
-        };
-        let mut out = BytesMut::new();
-        encode_startup(
-            &StartupRequest::Startup(StartupMessage::new(
-                ProtocolVersion::V3_0,
-                vec![
-                    ("user".to_owned(), "app_web".to_owned()),
-                    ("database".to_owned(), "shop".to_owned()),
-                ],
-            )),
-            &mut out,
-        );
-        client.write(&out).await?;
-        assert!(matches!(
-            client.read_message().await?,
-            Message::AuthenticationOk
-        ));
-
-        let mut parameters = Vec::new();
-        let mut key = None;
-        loop {
-            match client.read_message().await? {
-                Message::ParameterStatus(body) => parameters.push((
-                    body.name().unwrap().to_owned(),
-                    body.value().unwrap().to_owned(),
-                )),
-                Message::BackendKeyData(body) => {
-                    key = Some(CancelKey {
-                        process_id: body.process_id(),
-                        secret_key: body.secret_key(),
-                    });
-                }
-                Message::ReadyForQuery(body) => {
-                    assert_eq!(body.status(), b'I');
-                    let key = key.expect("a BackendKeyData before ReadyForQuery");
-                    return Ok((client, parameters, key));
-                }
-                _ => panic!("unexpected message in the greeting"),
-            }
-        }
-    }
-
-    async fn write(&mut self, bytes: &[u8]) -> turmoil::Result {
-        self.stream.write_all(bytes).await?;
-        self.stream.flush().await?;
-        Ok(())
-    }
-
-    async fn send_query(&mut self, sql: &str) -> turmoil::Result {
-        let mut body = BytesMut::new();
-        body.put_slice(sql.as_bytes());
-        body.put_u8(0);
-        let mut out = BytesMut::new();
-        encode_frame(b'Q', &body, &mut out);
-        self.write(&out).await
-    }
-
-    async fn read_frame(&mut self) -> turmoil::Result<Frame> {
-        loop {
-            if let Some(frame) = decode_frame(&mut self.buf, MAX_FRAME)? {
-                return Ok(frame);
-            }
-            assert!(
-                self.stream.read_buf(&mut self.buf).await? > 0,
-                "the proxy closed"
-            );
-        }
-    }
-
-    async fn read_message(&mut self) -> turmoil::Result<Message> {
-        let frame = self.read_frame().await?;
-        let mut bytes = BytesMut::new();
-        encode_frame(frame.tag, &frame.body, &mut bytes);
-        Ok(Message::parse(&mut bytes).unwrap().unwrap())
-    }
-
-    async fn read_result(&mut self) -> turmoil::Result<(Vec<String>, u8)> {
-        let mut rows = Vec::new();
-        loop {
-            match self.read_message().await? {
-                Message::DataRow(body) => {
-                    let mut ranges = body.ranges();
-                    while let Some(range) = ranges.next()? {
-                        let range = range.expect("a non-null value");
-                        rows.push(String::from_utf8(body.buffer()[range].to_vec())?);
-                    }
-                }
-                Message::ReadyForQuery(body) => return Ok((rows, body.status())),
-                Message::RowDescription(_) | Message::CommandComplete(_) => {}
-                _ => panic!("unexpected message in a query result"),
-            }
-        }
-    }
-
-    async fn query(&mut self, sql: &str) -> turmoil::Result<(Vec<String>, u8)> {
-        self.send_query(sql).await?;
-        self.read_result().await
-    }
-}
-
 async fn connect(rt: &TurmoilRuntime) -> turmoil::Result<WireClientOverTurmoil> {
     let stream = rt.connect("proxy:6432").await?;
-    let (client, _, _) = WireClient::hello(stream).await?;
-    Ok(client)
+    Ok(WireClient::login(stream, "app_web", "shop", None).await?)
 }
 
 type WireClientOverTurmoil = WireClient<<TurmoilRuntime as Net>::Stream>;
@@ -217,17 +98,23 @@ fn two_clients_are_served_by_one_server_connection() {
         let monitor = CapMonitor::start(&rt, observed, 1, POLL);
 
         let stream = rt.connect("proxy:6432").await?;
-        let (mut first, parameters, first_key) = WireClient::hello(stream).await?;
+        let mut first = WireClient::login(stream, "app_web", "shop", None).await?;
+        let first_key = first.cancel_key();
         assert!(
-            parameters.iter().any(|(name, _)| name == "server_version"),
-            "the greeting must carry the server parameters: {parameters:?}"
+            first
+                .parameters()
+                .iter()
+                .any(|(name, _)| name == "server_version"),
+            "the greeting must carry the server parameters: {:?}",
+            first.parameters()
         );
         let (rows, ready) = first.query("SELECT 1").await?;
         assert_eq!(ready, b'I');
         let backend = rows[0].clone();
 
         let stream = rt.connect("proxy:6432").await?;
-        let (mut second, _, second_key) = WireClient::hello(stream).await?;
+        let mut second = WireClient::login(stream, "app_web", "shop", None).await?;
+        let second_key = second.cancel_key();
         let (rows, ready) = second.query("SELECT 1").await?;
         assert_eq!(ready, b'I');
         assert_eq!(

@@ -1,0 +1,155 @@
+use std::fmt;
+use std::future::Future;
+use std::io;
+use std::time::Duration;
+
+use pgsteward_core::budget::ServerLimits;
+use pgsteward_core::rt::turmoil_rt::TurmoilRuntime;
+use pgsteward_core::rt::{Clock, Net};
+use pgsteward_node::config::{ClusterConfig, NodeConfig};
+use pgsteward_node::serve::{ServeOptions, serve};
+use turmoil::Sim;
+
+use crate::fake_postgres::{FakePostgres, FakePostgresStats};
+
+pub const DB: &str = "db";
+const DB_PORT: u16 = 5432;
+const NODE_PORT: u16 = 6432;
+const LISTEN_RETRY: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone)]
+pub struct ClusterSpec {
+    pub nodes: usize,
+    pub limits: ServerLimits,
+    pub node: NodeConfig,
+    pub cluster: ClusterConfig,
+    pub options: ServeOptions,
+}
+
+/// One fake PostgreSQL and `nodes` nodes pointed at it, inside one turmoil
+/// simulation whose randomness all comes from the seed.
+pub struct SimCluster<'a> {
+    sim: Sim<'a>,
+    stats: FakePostgresStats,
+}
+
+impl fmt::Debug for SimCluster<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SimCluster")
+            .field("elapsed", &self.sim.elapsed())
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SimCluster<'_> {
+    pub fn start(seed: u64, duration: Duration, spec: &ClusterSpec) -> Self {
+        let mut sim = turmoil::Builder::new()
+            .rng_seed(seed)
+            .simulation_duration(duration)
+            .build();
+        let stats = FakePostgresStats::default();
+        start_db(&mut sim, stats.clone(), spec.limits);
+        for index in 0..spec.nodes {
+            start_node(&mut sim, index, spec);
+        }
+        Self { sim, stats }
+    }
+
+    pub fn node(index: usize) -> String {
+        format!("node-{index}")
+    }
+
+    pub fn stats(&self) -> &FakePostgresStats {
+        &self.stats
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.sim.elapsed()
+    }
+
+    pub fn client<F>(&mut self, name: &str, client: F)
+    where
+        F: Future<Output = turmoil::Result> + 'static,
+    {
+        self.sim.client(name, client);
+    }
+
+    pub fn kill(&mut self, index: usize) {
+        self.sim.crash(Self::node(index));
+    }
+
+    pub fn restart(&mut self, index: usize) {
+        self.sim.bounce(Self::node(index));
+    }
+
+    pub fn partition(&self, a: &str, b: &str) {
+        self.sim.partition(a, b);
+    }
+
+    pub fn repair(&self, a: &str, b: &str) {
+        self.sim.repair(a, b);
+    }
+
+    pub fn delay(&self, a: &str, b: &str, latency: Duration) {
+        self.sim.set_link_latency(a, b, latency);
+    }
+
+    /// Runs until every client added so far has finished.
+    pub fn run(&mut self) -> turmoil::Result {
+        self.sim.run()
+    }
+
+    /// Runs for `span` of simulated time, whether or not the clients finish.
+    pub fn run_for(&mut self, span: Duration) -> turmoil::Result {
+        let until = self.sim.elapsed() + span;
+        while self.sim.elapsed() < until {
+            self.sim.step()?;
+        }
+        Ok(())
+    }
+}
+
+/// A node listens only once it has derived the total budget, so a client that
+/// starts with the cluster is refused until then.
+pub async fn connect_to_node(
+    rt: &TurmoilRuntime,
+    index: usize,
+) -> io::Result<<TurmoilRuntime as Net>::Stream> {
+    let addr = format!("{}:{NODE_PORT}", SimCluster::node(index));
+    loop {
+        match rt.connect(&addr).await {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                rt.sleep(LISTEN_RETRY).await;
+            }
+            connected => return connected,
+        }
+    }
+}
+
+fn start_db(sim: &mut Sim<'_>, stats: FakePostgresStats, limits: ServerLimits) {
+    sim.host(DB, move || {
+        let stats = stats.clone();
+        async move {
+            let rt = TurmoilRuntime::new();
+            FakePostgres::start_with_limits(&rt, &format!("0.0.0.0:{DB_PORT}"), stats, limits)
+                .await?;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    });
+}
+
+fn start_node(sim: &mut Sim<'_>, index: usize, spec: &ClusterSpec) {
+    let spec = spec.clone();
+    sim.host(SimCluster::node(index), move || {
+        let spec = spec.clone();
+        async move {
+            let rt = TurmoilRuntime::new();
+            let serving = serve(rt, spec.node, spec.cluster, spec.options).await?;
+            std::future::pending::<()>().await;
+            drop(serving);
+            Ok(())
+        }
+    });
+}
