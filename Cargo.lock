@@ -1759,6 +1759,7 @@ dependencies = [
  "fallible-iterator",
  "pgsteward-core",
  "pgsteward-harness",
+ "pgsteward-node",
  "pgsteward-protocol",
  "pgsteward-sched",
  "postgres-protocol",
