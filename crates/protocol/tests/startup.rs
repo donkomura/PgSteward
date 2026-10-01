@@ -117,7 +117,7 @@ fn startup_message_without_user_has_neither_user_nor_database() {
 #[test]
 fn startup_message_with_empty_parameter_list_is_accepted() {
     let message = decode_startup_message(&[]);
-    assert!(message.parameters().is_empty());
+    assert_eq!(message.parameters(), []);
     assert_eq!(message.user(), None);
 }
 

@@ -25,6 +25,8 @@ use postgres_protocol::message::backend::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 use tokio::task::JoinHandle;
 
+const NO_ROWS: [Vec<Option<String>>; 0] = [];
+
 const PROXY: &str = "10.0.0.1:6432";
 const SECOND_PROXY: &str = "10.0.0.1:6432/1";
 const OTHER_PROXY: &str = "10.0.0.2:6432";
@@ -556,9 +558,9 @@ fn a_result_set_is_written_as_its_columns_then_its_rows_then_a_command_tag() {
 fn a_console_that_holds_nothing_answers_with_no_rows() {
     let view = view(AllocationTable::new(), Vec::new(), Vec::new());
 
-    assert!(show_pools(&view).rows.is_empty());
-    assert!(show_budget(&view).rows.is_empty());
-    assert!(show_instances(&view).rows.is_empty());
+    assert_eq!(show_pools(&view).rows, NO_ROWS);
+    assert_eq!(show_budget(&view).rows, NO_ROWS);
+    assert_eq!(show_instances(&view).rows, NO_ROWS);
 }
 
 #[test]
@@ -829,7 +831,7 @@ async fn terminate_ends_the_console_session() {
         .await
         .expect("the console task")
         .expect("a clean end");
-    assert!(client.read_to_end().await.is_empty());
+    assert_eq!(client.read_to_end().await, [] as [u8; 0]);
 }
 
 #[tokio::test]

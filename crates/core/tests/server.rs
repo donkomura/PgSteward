@@ -228,7 +228,7 @@ async fn md5_without_a_configured_password_is_refused_and_nothing_more_is_sent()
         "{err:?}"
     );
     assert!(err.to_string().contains("password"), "{err}");
-    assert!(server.await.unwrap().is_empty());
+    assert_eq!(server.await.unwrap(), [] as [u8; 0]);
 }
 
 #[tokio::test]
@@ -253,7 +253,7 @@ async fn cleartext_password_authentication_is_not_supported() {
         "{err:?}"
     );
     assert!(err.to_string().contains("cleartext"), "{err}");
-    assert!(server.await.unwrap().is_empty());
+    assert_eq!(server.await.unwrap(), [] as [u8; 0]);
 }
 
 const SCRAM_SALT: &[u8] = b"pgsteward-salt16";
@@ -484,7 +484,7 @@ async fn a_forged_server_signature_fails_the_handshake() {
     .unwrap_err();
 
     assert!(matches!(err, HandshakeError::Scram(_)), "{err:?}");
-    assert!(server.await.unwrap().is_empty());
+    assert_eq!(server.await.unwrap(), [] as [u8; 0]);
 }
 
 #[tokio::test]
@@ -530,7 +530,7 @@ async fn scram_without_a_configured_password_is_refused_and_nothing_more_is_sent
         "{err:?}"
     );
     assert!(err.to_string().contains("SCRAM-SHA-256"), "{err}");
-    assert!(server.await.unwrap().is_empty());
+    assert_eq!(server.await.unwrap(), [] as [u8; 0]);
 }
 
 #[tokio::test]
@@ -557,7 +557,7 @@ async fn sasl_without_scram_sha_256_is_not_supported() {
         "{err:?}"
     );
     assert!(err.to_string().contains("SCRAM-SHA-256"), "{err}");
-    assert!(server.await.unwrap().is_empty());
+    assert_eq!(server.await.unwrap(), [] as [u8; 0]);
 }
 
 #[tokio::test]
@@ -712,7 +712,7 @@ async fn terminate_sends_the_terminate_message_and_closes() {
     let (frame, rest) = server.await.unwrap();
     assert_eq!(frame.tag, b'X');
     assert!(frame.body.is_empty());
-    assert!(rest.is_empty());
+    assert_eq!(rest, [] as [u8; 0]);
 }
 
 #[tokio::test]

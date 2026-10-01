@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pgsteward_core::allocation::{Holder, InstanceId, ProxyId};
-use pgsteward_core::budget::{BudgetChange, InstanceBudget, ServerLimits};
+use pgsteward_core::budget::{BudgetChange, InstanceBudget, ServerLimits, TotalBudget};
 use pgsteward_core::grant::{GrantChannel, InProcessCoordinator, Report, TenantPolicy, Usage};
 use pgsteward_core::policy::{Policies, PolicyChange, SettingError, TenantRule};
 use pgsteward_core::rt::Instant;
@@ -394,7 +394,10 @@ fn an_instance_the_coordinator_does_not_hold_is_not_observed() {
         coordinator.observe_instance(&primary(), Instant::now(), 30),
         None
     );
-    assert!(coordinator.instances().is_empty());
+    assert_eq!(
+        coordinator.instances(),
+        Vec::<(InstanceId, TotalBudget)>::new()
+    );
 }
 
 #[tokio::test]

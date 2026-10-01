@@ -63,5 +63,5 @@ async fn reports_violation_when_more_pgsteward_connections_than_cap() {
 
     let report = monitor.stop().await;
     assert_eq!(report.peak(), 2);
-    assert!(!report.violations().is_empty());
+    assert_ne!(report.violations(), []);
 }
