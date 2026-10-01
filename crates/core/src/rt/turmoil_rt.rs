@@ -33,14 +33,14 @@ impl Spawner for TurmoilRuntime {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        tokio::spawn(future)
+        tokio::task::spawn_local(future)
     }
 
     fn spawn_worker<F>(&self, _name: String, future: F) -> io::Result<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        tokio::spawn(future);
+        tokio::task::spawn_local(future);
         Ok(())
     }
 }

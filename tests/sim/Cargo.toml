@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 pgsteward-core = { workspace = true, features = ["turmoil"] }
-pgsteward-harness.workspace = true
+pgsteward-harness = { workspace = true, features = ["turmoil"] }
 pgsteward-node.workspace = true
 pgsteward-protocol.workspace = true
 pgsteward-sched.workspace = true
