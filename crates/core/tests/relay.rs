@@ -424,7 +424,7 @@ async fn a_server_that_closes_closes_the_client_connection() {
     client.read_greeting().await;
 
     drop(backend);
-    assert!(client.read_to_end().await.is_empty());
+    assert_eq!(client.read_to_end().await, [] as [u8; 0]);
 
     drop(client);
     relay.await.unwrap().unwrap();
@@ -763,7 +763,7 @@ async fn an_unknown_client_message_fails_the_assignment_before_it_reaches_the_se
     let (boundary, _pending, server) = assignment.await.unwrap();
     assert!(matches!(boundary.unwrap_err(), RelayError::Message(_)));
     drop(server);
-    assert!(backend.read_to_end().await.is_empty());
+    assert_eq!(backend.read_to_end().await, [] as [u8; 0]);
 }
 
 fn parse_frame(statement: &str, sql: &str) -> Vec<u8> {

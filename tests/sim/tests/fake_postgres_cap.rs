@@ -54,5 +54,5 @@ fn fake_postgres_counts_live_connections_and_releases_them() {
 fn fake_postgres_reports_cap_violation() {
     let report = run_with_connections(4, 3);
     assert_eq!(report.peak(), 4);
-    assert!(!report.violations().is_empty());
+    assert_ne!(report.violations(), []);
 }

@@ -86,20 +86,23 @@ impl Opener {
     }
 
     fn refuse_once(&self) -> bool {
-        self.refusals
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                (left > 0).then(|| left - 1)
-            })
-            .is_ok()
+        take_one(&self.refusals)
     }
 
     fn fail_one_reset(&self) -> bool {
-        self.reset_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                (left > 0).then(|| left - 1)
-            })
-            .is_ok()
+        take_one(&self.reset_failures)
     }
+}
+
+fn take_one(left: &AtomicUsize) -> bool {
+    let mut current = left.load(Ordering::SeqCst);
+    while current > 0 {
+        match left.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
 }
 
 impl OpenServer for Opener {

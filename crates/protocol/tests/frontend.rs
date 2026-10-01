@@ -27,7 +27,7 @@ fn a_sasl_initial_response_without_data_declares_a_length_of_minus_one() {
 
     let decoded = decode_sasl_initial_response(&body).expect("a well-formed body");
     assert_eq!(decoded.mechanism, "SCRAM-SHA-256");
-    assert!(decoded.data.is_empty());
+    assert_eq!(decoded.data, []);
 }
 
 #[test]
