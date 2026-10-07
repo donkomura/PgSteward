@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -11,6 +12,29 @@ pub use tokio::time::Instant;
 pub mod tokio_rt;
 #[cfg(feature = "turmoil")]
 pub mod turmoil_rt;
+
+/// How fast a host's clock runs against simulated time, in millionths: a
+/// clock at 1,001,000 gains a millisecond every second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClockRate {
+    per_million: NonZeroU32,
+}
+
+impl ClockRate {
+    pub const EXACT: Self = Self {
+        per_million: NonZeroU32::new(1_000_000).unwrap(),
+    };
+
+    #[must_use]
+    pub fn per_million(per_million: NonZeroU32) -> Self {
+        Self { per_million }
+    }
+
+    #[must_use]
+    pub fn get(self) -> NonZeroU32 {
+        self.per_million
+    }
+}
 
 pub trait Clock: Clone + Send + Sync + 'static {
     fn now(&self) -> Instant;

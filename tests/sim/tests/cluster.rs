@@ -1,9 +1,12 @@
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pgsteward_core::budget::ServerLimits;
+use pgsteward_core::rt::ClockRate;
 use pgsteward_core::rt::turmoil_rt::TurmoilRuntime;
 use pgsteward_harness::cluster::{ClusterSpec, DB, SimCluster, connect_to_node};
+use pgsteward_harness::faults::{Fault, FaultPlan, Incident, Scenario};
 use pgsteward_harness::wire_client::WireClient;
 use pgsteward_node::config::{ClusterConfig, NodeConfig};
 use pgsteward_node::serve::ServeOptions;
@@ -12,6 +15,14 @@ const PENCIL_VERIFIER: &str = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
 WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
 const TRANSACTIONS: usize = 3;
 const SEEDS: u64 = 5;
+const FAULTS: FaultPlan = FaultPlan {
+    nodes: 3,
+    span: Duration::from_secs(20),
+    incidents: 6,
+    longest: Duration::from_secs(4),
+    slowest: Duration::from_millis(300),
+    drift: 100_000,
+};
 const LIMITS: ServerLimits = ServerLimits {
     max_connections: 40,
     superuser_reserved_connections: 3,
@@ -58,6 +69,7 @@ instances = ["db"]
             observe_interval: Duration::from_millis(100),
             ..ServeOptions::default()
         },
+        clocks: Vec::new(),
     }
 }
 
@@ -272,5 +284,144 @@ fn the_same_seed_runs_the_cluster_the_same_way() {
     assert!(
         traces.windows(2).any(|pair| pair[0] != pair[1]),
         "different seeds must be able to run the cluster differently"
+    );
+}
+
+#[test]
+fn a_played_cut_off_keeps_the_node_from_serving_until_it_ends() {
+    let mut cluster = SimCluster::start(0, Duration::from_secs(60), &spec(2));
+    for node in 0..2 {
+        cluster.client(&format!("warm-{node}"), async move {
+            run_transactions(TurmoilRuntime::new(), node).await
+        });
+    }
+    cluster.run().unwrap();
+
+    let scenario = Scenario {
+        seed: 0,
+        clocks: Vec::new(),
+        incidents: vec![Incident {
+            from: Duration::ZERO,
+            until: Duration::from_secs(5),
+            node: 0,
+            fault: Fault::CutOff,
+        }],
+    };
+    let served: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    record_outcome(&mut cluster, "cut-0", 0, &served);
+    record_outcome(&mut cluster, "cut-1", 1, &served);
+    cluster.play(&scenario).unwrap();
+    assert!(
+        !served.lock().unwrap().contains(&("cut-0".to_owned(), true)),
+        "the node must not serve while the scenario cuts it off: {:?}",
+        served.lock().unwrap()
+    );
+    assert!(
+        served.lock().unwrap().contains(&("cut-1".to_owned(), true)),
+        "the other node must serve throughout: {:?}",
+        served.lock().unwrap()
+    );
+
+    record_outcome(&mut cluster, "healed-0", 0, &served);
+    cluster.run().unwrap();
+    assert!(
+        served
+            .lock()
+            .unwrap()
+            .contains(&("healed-0".to_owned(), true)),
+        "the node must serve once the scenario ends the cut-off: {:?}",
+        served.lock().unwrap()
+    );
+}
+
+#[test]
+fn every_node_serves_again_once_a_seeded_scenario_has_played() {
+    for seed in 0..SEEDS {
+        let scenario = Scenario::from_seed(seed, &FAULTS);
+        let spec = ClusterSpec {
+            clocks: scenario.clocks.clone(),
+            ..spec(FAULTS.nodes)
+        };
+        let mut cluster = SimCluster::start(seed, Duration::from_secs(120), &spec);
+        for node in 0..FAULTS.nodes {
+            cluster.client(&format!("warm-{node}"), async move {
+                run_transactions(TurmoilRuntime::new(), node).await
+            });
+        }
+        cluster.run().unwrap();
+
+        cluster.play(&scenario).unwrap();
+
+        let served: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        for node in 0..FAULTS.nodes {
+            record_outcome(&mut cluster, &format!("after-{node}"), node, &served);
+        }
+        cluster.run().unwrap();
+        let served = served.lock().unwrap();
+        assert!(
+            served.len() == FAULTS.nodes && served.iter().all(|(_, ok)| *ok),
+            "seed {seed}: every node must serve once every fault has healed: {served:?} under {scenario:?}"
+        );
+    }
+}
+
+fn time_to_give_up(clock: ClockRate) -> Duration {
+    let spec = ClusterSpec {
+        limits: ServerLimits {
+            max_connections: 5,
+            superuser_reserved_connections: 3,
+            reserved_connections: 0,
+        },
+        options: ServeOptions {
+            wait_timeout: Duration::from_secs(4),
+            ..spec(1).options
+        },
+        clocks: vec![clock],
+        ..spec(1)
+    };
+    let mut cluster = SimCluster::start(0, Duration::from_secs(60), &spec);
+    let waited = Arc::new(Mutex::new(None));
+    let out = Arc::clone(&waited);
+    cluster.client("app", async move {
+        let rt = TurmoilRuntime::new();
+        let mut holder = WireClient::login(
+            connect_to_node(&rt, 0).await?,
+            "alice",
+            "postgres",
+            Some("pencil"),
+        )
+        .await?;
+        assert_eq!(holder.query("BEGIN").await?.1, b'T');
+        let mut waiting = WireClient::login(
+            connect_to_node(&rt, 0).await?,
+            "alice",
+            "postgres",
+            Some("pencil"),
+        )
+        .await?;
+        let asked = turmoil::sim_elapsed().unwrap();
+        waiting.send_query("SELECT 1").await?;
+        assert_eq!(waiting.read_frame().await?.tag, b'E');
+        *out.lock().unwrap() = Some(turmoil::sim_elapsed().unwrap().checked_sub(asked).unwrap());
+        Ok(())
+    });
+    cluster.run().unwrap();
+    waited
+        .lock()
+        .unwrap()
+        .expect("the waiting client must be refused")
+}
+
+#[test]
+fn a_node_waits_out_the_wait_timeout_on_its_own_clock() {
+    let exact = time_to_give_up(ClockRate::EXACT);
+    let fast = time_to_give_up(ClockRate::per_million(NonZeroU32::new(2_000_000).unwrap()));
+    assert!(
+        exact >= Duration::from_secs(4),
+        "a node on the exact clock must wait the whole timeout: {exact:?}"
+    );
+    assert!(
+        fast >= Duration::from_secs(2) && fast < Duration::from_secs(3),
+        "a node whose clock runs twice as fast must give up in half the simulated time: {fast:?}"
     );
 }

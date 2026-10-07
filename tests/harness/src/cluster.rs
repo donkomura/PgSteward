@@ -5,17 +5,19 @@ use std::time::Duration;
 
 use pgsteward_core::budget::ServerLimits;
 use pgsteward_core::rt::turmoil_rt::TurmoilRuntime;
-use pgsteward_core::rt::{Clock, Net};
+use pgsteward_core::rt::{Clock, ClockRate, Net};
 use pgsteward_node::config::{ClusterConfig, NodeConfig};
 use pgsteward_node::serve::{ServeOptions, serve};
 use turmoil::Sim;
 
 use crate::fake_postgres::{FakePostgres, FakePostgresStats};
+use crate::faults::{Change, Fault, Scenario};
 
 pub const DB: &str = "db";
 const DB_PORT: u16 = 5432;
 const NODE_PORT: u16 = 6432;
 const LISTEN_RETRY: Duration = Duration::from_millis(10);
+const MAX_LATENCY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ClusterSpec {
@@ -24,6 +26,9 @@ pub struct ClusterSpec {
     pub node: NodeConfig,
     pub cluster: ClusterConfig,
     pub options: ServeOptions,
+    /// The rate of each node's clock by index. A node past the end of the list
+    /// runs on the exact clock.
+    pub clocks: Vec<ClockRate>,
 }
 
 /// One fake PostgreSQL and `nodes` nodes pointed at it, inside one turmoil
@@ -47,6 +52,8 @@ impl SimCluster<'_> {
         let mut sim = turmoil::Builder::new()
             .rng_seed(seed)
             .simulation_duration(duration)
+            .min_message_latency(Duration::ZERO)
+            .max_message_latency(MAX_LATENCY)
             .build();
         let stats = FakePostgresStats::default();
         start_db(&mut sim, stats.clone(), spec.limits);
@@ -95,6 +102,33 @@ impl SimCluster<'_> {
         self.sim.set_link_latency(a, b, latency);
     }
 
+    /// Applies each change of the scenario at its offset from now, and returns
+    /// once the last fault has healed.
+    pub fn play(&mut self, scenario: &Scenario) -> turmoil::Result {
+        let start = self.sim.elapsed();
+        for (at, node, change) in scenario.changes() {
+            self.run_until(start + at)?;
+            self.apply(node, change);
+        }
+        Ok(())
+    }
+
+    fn apply(&mut self, node: usize, change: Change) {
+        let host = Self::node(node);
+        match change {
+            Change::Begin(Fault::Crash) => self.kill(node),
+            Change::End(Fault::Crash) => self.restart(node),
+            Change::Begin(Fault::CutOff) => self.partition(&host, DB),
+            Change::End(Fault::CutOff) => self.repair(&host, DB),
+            Change::Begin(Fault::Slow(latency)) => self.delay(&host, DB, latency),
+            Change::End(Fault::Slow(_)) => {
+                self.sim.set_link_latency(host.as_str(), DB, Duration::ZERO);
+                self.sim
+                    .set_link_max_message_latency(host.as_str(), DB, MAX_LATENCY);
+            }
+        }
+    }
+
     /// Runs until every client added so far has finished.
     pub fn run(&mut self) -> turmoil::Result {
         self.sim.run()
@@ -102,7 +136,10 @@ impl SimCluster<'_> {
 
     /// Runs for `span` of simulated time, whether or not the clients finish.
     pub fn run_for(&mut self, span: Duration) -> turmoil::Result {
-        let until = self.sim.elapsed() + span;
+        self.run_until(self.sim.elapsed() + span)
+    }
+
+    fn run_until(&mut self, until: Duration) -> turmoil::Result {
         while self.sim.elapsed() < until {
             self.sim.step()?;
         }
@@ -142,10 +179,11 @@ fn start_db(sim: &mut Sim<'_>, stats: FakePostgresStats, limits: ServerLimits) {
 
 fn start_node(sim: &mut Sim<'_>, index: usize, spec: &ClusterSpec) {
     let spec = spec.clone();
+    let clock = spec.clocks.get(index).copied().unwrap_or(ClockRate::EXACT);
     sim.host(SimCluster::node(index), move || {
         let spec = spec.clone();
         async move {
-            let rt = TurmoilRuntime::new();
+            let rt = TurmoilRuntime::with_rate(clock);
             let serving = serve(rt, spec.node, spec.cluster, spec.options).await?;
             std::future::pending::<()>().await;
             drop(serving);
