@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::rc::Rc;
 use std::time::Duration;
 
 use pgsteward_core::budget::ServerLimits;
@@ -18,6 +20,8 @@ const DB_PORT: u16 = 5432;
 const NODE_PORT: u16 = 6432;
 const LISTEN_RETRY: Duration = Duration::from_millis(10);
 const MAX_LATENCY: Duration = Duration::from_millis(100);
+const PROBE_RETRY: Duration = Duration::from_millis(10);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct ClusterSpec {
@@ -36,6 +40,8 @@ pub struct ClusterSpec {
 pub struct SimCluster<'a> {
     sim: Sim<'a>,
     stats: FakePostgresStats,
+    nodes: usize,
+    probes: usize,
 }
 
 impl fmt::Debug for SimCluster<'_> {
@@ -60,7 +66,12 @@ impl SimCluster<'_> {
         for index in 0..spec.nodes {
             start_node(&mut sim, index, spec);
         }
-        Self { sim, stats }
+        Self {
+            sim,
+            stats,
+            nodes: spec.nodes,
+            probes: 0,
+        }
     }
 
     pub fn node(index: usize) -> String {
@@ -127,6 +138,50 @@ impl SimCluster<'_> {
                     .set_link_max_message_latency(host.as_str(), DB, MAX_LATENCY);
             }
         }
+    }
+
+    /// Measures, for each node, the simulated time from now until `probe`
+    /// first succeeds against it. A probe that has not finished within
+    /// `PROBE_TIMEOUT` is abandoned and tried again, since turmoil does not
+    /// resend what a partition dropped. Fails if the simulation ends first.
+    pub fn recovery<P, F>(&mut self, probe: P) -> turmoil::Result<Vec<Duration>>
+    where
+        P: Fn(TurmoilRuntime, usize) -> F + Clone + 'static,
+        F: Future<Output = io::Result<()>> + 'static,
+    {
+        let from = self.sim.elapsed();
+        let recovered = Rc::new(RefCell::new(vec![None; self.nodes]));
+        for node in 0..self.nodes {
+            let probe = probe.clone();
+            let recovered = Rc::clone(&recovered);
+            self.probes += 1;
+            self.sim
+                .client(format!("probe-{}", self.probes), async move {
+                    let rt = TurmoilRuntime::new();
+                    loop {
+                        let served = tokio::select! {
+                            outcome = probe(rt, node) => outcome.is_ok(),
+                            () = rt.sleep(PROBE_TIMEOUT) => false,
+                        };
+                        if served {
+                            break;
+                        }
+                        rt.sleep(PROBE_RETRY).await;
+                    }
+                    recovered.borrow_mut()[node] = turmoil::sim_elapsed();
+                    Ok(())
+                });
+        }
+        self.sim.run()?;
+        let recovered = recovered.borrow();
+        Ok(recovered
+            .iter()
+            .map(|at| {
+                at.expect("every probe has finished once the simulation has run")
+                    .checked_sub(from)
+                    .expect("a probe finishes after it starts")
+            })
+            .collect())
     }
 
     /// Runs until every client added so far has finished.
