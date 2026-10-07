@@ -5,25 +5,66 @@ use std::time::Duration;
 
 use turmoil::net::{TcpListener, TcpStream};
 
-use super::{Clock, Instant, JoinHandle, Listener, Net, Spawner};
+use super::{Clock, ClockRate, Instant, JoinHandle, Listener, Net, Spawner};
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TurmoilRuntime;
+/// A clock that runs at its own rate from the instant the runtime is made, so a
+/// host keeps one runtime and clones it rather than making another.
+#[derive(Debug, Clone, Copy)]
+pub struct TurmoilRuntime {
+    rate: ClockRate,
+    epoch: Instant,
+}
+
+impl Default for TurmoilRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TurmoilRuntime {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::with_rate(ClockRate::EXACT)
     }
+
+    #[must_use]
+    pub fn with_rate(rate: ClockRate) -> Self {
+        Self {
+            rate,
+            epoch: Instant::now(),
+        }
+    }
+
+    fn local(&self, simulated: Duration) -> Duration {
+        scale(
+            simulated,
+            self.rate.get().get(),
+            ClockRate::EXACT.get().get(),
+        )
+    }
+
+    fn simulated(&self, local: Duration) -> Duration {
+        scale(local, ClockRate::EXACT.get().get(), self.rate.get().get())
+    }
+}
+
+/// Rounds up, so that a sleep converted to simulated time lasts at least its
+/// whole duration on the clock that measures it.
+fn scale(duration: Duration, numerator: u32, denominator: u32) -> Duration {
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    let nanos = (duration.as_nanos() * u128::from(numerator)).div_ceil(u128::from(denominator));
+    let secs = u64::try_from(nanos / NANOS_PER_SEC).expect("a scaled duration fits in u64 seconds");
+    let subsec = u32::try_from(nanos % NANOS_PER_SEC).expect("a remainder of a second fits in u32");
+    Duration::new(secs, subsec)
 }
 
 impl Clock for TurmoilRuntime {
     fn now(&self) -> Instant {
-        Instant::now()
+        self.epoch + self.local(Instant::now().duration_since(self.epoch))
     }
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
-        tokio::time::sleep(duration)
+        tokio::time::sleep(self.simulated(duration))
     }
 }
 

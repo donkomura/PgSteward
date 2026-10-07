@@ -1,6 +1,8 @@
+use std::num::NonZeroU32;
 use std::time::Duration;
 
-use pgsteward_core::rt::{Clock, Net, Spawner, turmoil_rt::TurmoilRuntime};
+use pgsteward_core::rt::turmoil_rt::TurmoilRuntime;
+use pgsteward_core::rt::{Clock, ClockRate, Net, Spawner};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
@@ -14,6 +16,62 @@ fn clock_is_deterministic_under_simulation() {
         Ok(())
     });
     sim.run().unwrap();
+}
+
+fn rate(per_million: u32) -> ClockRate {
+    ClockRate::per_million(NonZeroU32::new(per_million).unwrap())
+}
+
+fn sleep_on(rate: ClockRate, duration: Duration) -> (Duration, Duration) {
+    let mut sim = turmoil::Builder::new().build();
+    let measured = std::rc::Rc::new(std::cell::Cell::new((Duration::ZERO, Duration::ZERO)));
+    let out = std::rc::Rc::clone(&measured);
+    sim.client("app", async move {
+        let rt = TurmoilRuntime::with_rate(rate);
+        let local = rt.now();
+        let simulated = turmoil::sim_elapsed().unwrap();
+        rt.sleep(duration).await;
+        out.set((
+            rt.now().duration_since(local),
+            turmoil::sim_elapsed()
+                .unwrap()
+                .checked_sub(simulated)
+                .unwrap(),
+        ));
+        Ok(())
+    });
+    sim.run().unwrap();
+    measured.get()
+}
+
+#[test]
+fn a_fast_clock_sleeps_through_its_duration_in_less_simulated_time() {
+    let (local, simulated) = sleep_on(rate(2_000_000), Duration::from_secs(4));
+    assert_eq!(local, Duration::from_secs(4));
+    assert_eq!(simulated, Duration::from_secs(2));
+}
+
+#[test]
+fn a_slow_clock_sleeps_through_its_duration_in_more_simulated_time() {
+    let (local, simulated) = sleep_on(rate(500_000), Duration::from_secs(1));
+    assert_eq!(local, Duration::from_secs(1));
+    assert_eq!(simulated, Duration::from_secs(2));
+}
+
+#[test]
+fn a_skewed_clock_never_wakes_before_its_own_duration() {
+    let (local, _) = sleep_on(rate(3_000_000), Duration::from_secs(1));
+    assert!(
+        local >= Duration::from_secs(1),
+        "the sleep must last its whole duration on the clock that measures it: {local:?}"
+    );
+}
+
+#[test]
+fn the_exact_rate_keeps_the_simulated_clock() {
+    let (local, simulated) = sleep_on(ClockRate::EXACT, Duration::from_millis(1500));
+    assert_eq!(local, Duration::from_millis(1500));
+    assert_eq!(simulated, Duration::from_millis(1500));
 }
 
 #[test]

@@ -19,11 +19,15 @@ pgsteward-protocol.workspace = true
 bytes.workspace = true
 fallible-iterator.workspace = true
 postgres-protocol.workspace = true
+rand.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres = { workspace = true, optional = true }
 tracing.workspace = true
 turmoil = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

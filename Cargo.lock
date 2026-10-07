@@ -1691,6 +1691,8 @@ dependencies = [
  "pgsteward-node",
  "pgsteward-protocol",
  "postgres-protocol",
+ "proptest",
+ "rand 0.10.2",
  "thiserror",
  "tokio",
  "tokio-postgres",
