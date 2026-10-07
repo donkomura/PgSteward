@@ -425,3 +425,98 @@ fn a_node_waits_out_the_wait_timeout_on_its_own_clock() {
         "a node whose clock runs twice as fast must give up in half the simulated time: {fast:?}"
     );
 }
+
+async fn one_transaction(rt: TurmoilRuntime, node: usize) -> std::io::Result<()> {
+    let stream = connect_to_node(&rt, node).await?;
+    let mut client = WireClient::login(stream, "alice", "postgres", Some("pencil")).await?;
+    assert_eq!(client.query("SELECT 1").await?.1, b'I');
+    Ok(())
+}
+
+fn warm(cluster: &mut SimCluster<'_>, nodes: usize) {
+    for node in 0..nodes {
+        cluster.client(&format!("warm-{node}"), async move {
+            run_transactions(TurmoilRuntime::new(), node).await
+        });
+    }
+    cluster.run().unwrap();
+}
+
+#[test]
+fn an_untouched_cluster_recovers_at_once() {
+    let mut cluster = SimCluster::start(0, Duration::from_secs(60), &spec(3));
+    warm(&mut cluster, 3);
+
+    let recovery = cluster.recovery(one_transaction).unwrap();
+
+    assert_eq!(
+        recovery.len(),
+        3,
+        "one recovery time per node: {recovery:?}"
+    );
+    assert!(
+        recovery.iter().all(|took| *took < Duration::from_secs(1)),
+        "a node that never failed must serve within one transaction: {recovery:?}"
+    );
+}
+
+#[test]
+fn a_node_that_has_just_restarted_takes_longer_to_recover() {
+    let mut cluster = SimCluster::start(0, Duration::from_secs(60), &spec(2));
+    warm(&mut cluster, 2);
+    let scenario = Scenario {
+        seed: 0,
+        clocks: Vec::new(),
+        incidents: vec![Incident {
+            from: Duration::ZERO,
+            until: Duration::from_secs(5),
+            node: 0,
+            fault: Fault::Crash,
+        }],
+    };
+    cluster.play(&scenario).unwrap();
+
+    let recovery = cluster.recovery(one_transaction).unwrap();
+
+    assert!(
+        recovery[0] > recovery[1],
+        "the restarted node must derive its total budget before it serves: {recovery:?}"
+    );
+}
+
+#[test]
+fn a_node_that_never_reaches_the_database_again_never_recovers() {
+    let mut cluster = SimCluster::start(0, Duration::from_secs(30), &spec(1));
+    warm(&mut cluster, 1);
+    cluster.partition(&SimCluster::node(0), DB);
+
+    assert!(
+        cluster.recovery(one_transaction).is_err(),
+        "recovery must fail when the simulation ends before the node serves"
+    );
+}
+
+fn recovery_after(seed: u64) -> Vec<Duration> {
+    let scenario = Scenario::from_seed(seed, &FAULTS);
+    let spec = ClusterSpec {
+        clocks: scenario.clocks.clone(),
+        ..spec(FAULTS.nodes)
+    };
+    let mut cluster = SimCluster::start(seed, Duration::from_secs(120), &spec);
+    warm(&mut cluster, FAULTS.nodes);
+    cluster.play(&scenario).unwrap();
+    cluster
+        .recovery(one_transaction)
+        .unwrap_or_else(|error| panic!("seed {seed}: {error} under {scenario:?}"))
+}
+
+#[test]
+fn the_same_seed_recovers_in_the_same_time() {
+    for seed in 0..SEEDS {
+        assert_eq!(
+            recovery_after(seed),
+            recovery_after(seed),
+            "seed {seed}: the same seed must recover in the same simulated time"
+        );
+    }
+}
